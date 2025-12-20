@@ -20,6 +20,7 @@ var readyCmd = &cobra.Command{
 		sortPolicy, _ := cmd.Flags().GetString("sort")
 		labels, _ := cmd.Flags().GetStringSlice("label")
 		labelsAny, _ := cmd.Flags().GetStringSlice("label-any")
+		issueType, _ := cmd.Flags().GetString("type")
 		// Use global jsonOutput set by PersistentPreRun (respects config.yaml + env vars)
 
 		// Normalize labels: trim, dedupe, remove empty
@@ -28,6 +29,7 @@ var readyCmd = &cobra.Command{
 
 		filter := types.WorkFilter{
 			// Leave Status empty to get both 'open' and 'in_progress' (bd-165)
+			Type:       issueType,
 			Limit:      limit,
 			Unassigned: unassigned,
 			SortPolicy: types.SortPolicy(sortPolicy),
@@ -52,6 +54,7 @@ var readyCmd = &cobra.Command{
 			readyArgs := &rpc.ReadyArgs{
 				Assignee:   assignee,
 				Unassigned: unassigned,
+				Type:       issueType,
 				Limit:      limit,
 				SortPolicy: sortPolicy,
 				Labels:     labels,
@@ -272,6 +275,9 @@ var statsCmd = &cobra.Command{
 			if stats.TombstoneIssues > 0 {
 				fmt.Printf("Deleted:           %d (tombstones)\n", stats.TombstoneIssues)
 			}
+			if stats.PinnedIssues > 0 {
+				fmt.Printf("Pinned:            %d\n", stats.PinnedIssues)
+			}
 			if stats.AverageLeadTime > 0 {
 				fmt.Printf("Avg Lead Time:     %.1f hours\n", stats.AverageLeadTime)
 			}
@@ -313,6 +319,9 @@ var statsCmd = &cobra.Command{
 		if stats.TombstoneIssues > 0 {
 			fmt.Printf("Deleted:                %d (tombstones)\n", stats.TombstoneIssues)
 		}
+		if stats.PinnedIssues > 0 {
+			fmt.Printf("Pinned:                 %d\n", stats.PinnedIssues)
+		}
 		if stats.EpicsEligibleForClosure > 0 {
 			fmt.Printf("Epics Ready to Close:   %s\n", green(fmt.Sprintf("%d", stats.EpicsEligibleForClosure)))
 		}
@@ -330,6 +339,7 @@ func init() {
 	readyCmd.Flags().StringP("sort", "s", "hybrid", "Sort policy: hybrid (default), priority, oldest")
 	readyCmd.Flags().StringSliceP("label", "l", []string{}, "Filter by labels (AND: must have ALL). Can combine with --label-any")
 	readyCmd.Flags().StringSlice("label-any", []string{}, "Filter by labels (OR: must have AT LEAST ONE). Can combine with --label")
+	readyCmd.Flags().StringP("type", "t", "", "Filter by issue type (task, bug, feature, epic, merge-request)")
 	rootCmd.AddCommand(readyCmd)
 	rootCmd.AddCommand(blockedCmd)
 	rootCmd.AddCommand(statsCmd)

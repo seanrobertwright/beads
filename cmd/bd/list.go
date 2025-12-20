@@ -37,6 +37,14 @@ func parseTimeFlag(s string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("unable to parse time %q (try formats: 2006-01-02, 2006-01-02T15:04:05, or RFC3339)", s)
 }
 
+// pinIndicator returns a pushpin emoji prefix for pinned issues (bd-18b)
+func pinIndicator(issue *types.Issue) string {
+	if issue.Status == types.StatusPinned {
+		return "📌 "
+	}
+	return ""
+}
+
 // sortIssues sorts a slice of issues by the specified field and direction
 func sortIssues(issues []*types.Issue, sortBy string, reverse bool) {
 	if sortBy == "" {
@@ -128,7 +136,11 @@ var listCmd = &cobra.Command{
 		// Priority range flags
 		priorityMinStr, _ := cmd.Flags().GetString("priority-min")
 		priorityMaxStr, _ := cmd.Flags().GetString("priority-max")
-		
+
+		// Pinned filtering flags (bd-p8e)
+		pinnedFlag, _ := cmd.Flags().GetBool("pinned")
+		noPinnedFlag, _ := cmd.Flags().GetBool("no-pinned")
+
 		// Use global jsonOutput set by PersistentPreRun
 
 		// Normalize labels: trim, dedupe, remove empty
@@ -265,6 +277,19 @@ var listCmd = &cobra.Command{
 			filter.PriorityMax = &priorityMax
 		}
 
+		// Pinned filtering (bd-p8e): --pinned and --no-pinned are mutually exclusive
+		if pinnedFlag && noPinnedFlag {
+			fmt.Fprintf(os.Stderr, "Error: --pinned and --no-pinned are mutually exclusive\n")
+			os.Exit(1)
+		}
+		if pinnedFlag {
+			pinned := true
+			filter.Pinned = &pinned
+		} else if noPinnedFlag {
+			pinned := false
+			filter.Pinned = &pinned
+		}
+
 		// Check database freshness before reading (bd-2q6d, bd-c4rq)
 		// Skip check when using daemon (daemon auto-imports on staleness)
 		ctx := rootCtx
@@ -340,6 +365,9 @@ var listCmd = &cobra.Command{
 			listArgs.PriorityMin = filter.PriorityMin
 			listArgs.PriorityMax = filter.PriorityMax
 
+			// Pinned filtering (bd-p8e)
+			listArgs.Pinned = filter.Pinned
+
 			 resp, err := daemonClient.List(listArgs)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -373,7 +401,7 @@ var listCmd = &cobra.Command{
 				// Long format: multi-line with details
 				fmt.Printf("\nFound %d issues:\n\n", len(issues))
 				for _, issue := range issues {
-					fmt.Printf("%s [P%d] [%s] %s\n", issue.ID, issue.Priority, issue.IssueType, issue.Status)
+					fmt.Printf("%s%s [P%d] [%s] %s\n", pinIndicator(issue), issue.ID, issue.Priority, issue.IssueType, issue.Status)
 					fmt.Printf("  %s\n", issue.Title)
 					if issue.Assignee != "" {
 						fmt.Printf("  Assignee: %s\n", issue.Assignee)
@@ -394,8 +422,8 @@ var listCmd = &cobra.Command{
 					if issue.Assignee != "" {
 						assigneeStr = fmt.Sprintf(" @%s", issue.Assignee)
 					}
-					fmt.Printf("%s [P%d] [%s] %s%s%s - %s\n",
-						issue.ID, issue.Priority, issue.IssueType, issue.Status,
+					fmt.Printf("%s%s [P%d] [%s] %s%s%s - %s\n",
+						pinIndicator(issue), issue.ID, issue.Priority, issue.IssueType, issue.Status,
 						assigneeStr, labelsStr, issue.Title)
 				}
 			}
@@ -481,7 +509,7 @@ var listCmd = &cobra.Command{
 			for _, issue := range issues {
 				labels := labelsMap[issue.ID]
 
-				fmt.Printf("%s [P%d] [%s] %s\n", issue.ID, issue.Priority, issue.IssueType, issue.Status)
+				fmt.Printf("%s%s [P%d] [%s] %s\n", pinIndicator(issue), issue.ID, issue.Priority, issue.IssueType, issue.Status)
 				fmt.Printf("  %s\n", issue.Title)
 				if issue.Assignee != "" {
 					fmt.Printf("  Assignee: %s\n", issue.Assignee)
@@ -504,8 +532,8 @@ var listCmd = &cobra.Command{
 				if issue.Assignee != "" {
 					assigneeStr = fmt.Sprintf(" @%s", issue.Assignee)
 				}
-				fmt.Printf("%s [P%d] [%s] %s%s%s - %s\n",
-					issue.ID, issue.Priority, issue.IssueType, issue.Status,
+				fmt.Printf("%s%s [P%d] [%s] %s%s%s - %s\n",
+					pinIndicator(issue), issue.ID, issue.Priority, issue.IssueType, issue.Status,
 					assigneeStr, labelsStr, issue.Title)
 			}
 		}
@@ -519,7 +547,7 @@ func init() {
 	listCmd.Flags().StringP("status", "s", "", "Filter by status (open, in_progress, blocked, closed)")
 	registerPriorityFlag(listCmd, "")
 	listCmd.Flags().StringP("assignee", "a", "", "Filter by assignee")
-	listCmd.Flags().StringP("type", "t", "", "Filter by type (bug, feature, task, epic, chore)")
+	listCmd.Flags().StringP("type", "t", "", "Filter by type (bug, feature, task, epic, chore, merge-request)")
 	listCmd.Flags().StringSliceP("label", "l", []string{}, "Filter by labels (AND: must have ALL). Can combine with --label-any")
 	listCmd.Flags().StringSlice("label-any", []string{}, "Filter by labels (OR: must have AT LEAST ONE). Can combine with --label")
 	listCmd.Flags().String("title", "", "Filter by title text (case-insensitive substring match)")
@@ -552,7 +580,11 @@ func init() {
 	// Priority ranges
 	listCmd.Flags().String("priority-min", "", "Filter by minimum priority (inclusive, 0-4 or P0-P4)")
 	listCmd.Flags().String("priority-max", "", "Filter by maximum priority (inclusive, 0-4 or P0-P4)")
-	
+
+	// Pinned filtering (bd-p8e)
+	listCmd.Flags().Bool("pinned", false, "Show only pinned issues")
+	listCmd.Flags().Bool("no-pinned", false, "Exclude pinned issues")
+
 	// Note: --json flag is defined as a persistent flag in main.go, not here
 	rootCmd.AddCommand(listCmd)
 }

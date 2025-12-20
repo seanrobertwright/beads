@@ -35,10 +35,19 @@ type Issue struct {
 	Dependencies       []*Dependency  `json:"dependencies,omitempty"` // Populated only for export/import
 	Comments           []*Comment     `json:"comments,omitempty"`     // Populated only for export/import
 	// Tombstone fields (bd-vw8): inline soft-delete support
-	DeletedAt     *time.Time `json:"deleted_at,omitempty"`     // When the issue was deleted
-	DeletedBy     string     `json:"deleted_by,omitempty"`     // Who deleted the issue
-	DeleteReason  string     `json:"delete_reason,omitempty"`  // Why the issue was deleted
-	OriginalType  string     `json:"original_type,omitempty"`  // Issue type before deletion (for tombstones)
+	DeletedAt    *time.Time `json:"deleted_at,omitempty"`    // When the issue was deleted
+	DeletedBy    string     `json:"deleted_by,omitempty"`    // Who deleted the issue
+	DeleteReason string     `json:"delete_reason,omitempty"` // Why the issue was deleted
+	OriginalType string     `json:"original_type,omitempty"` // Issue type before deletion (for tombstones)
+
+	// Messaging fields (bd-kwro): inter-agent communication support
+	Sender    string `json:"sender,omitempty"`    // Who sent this (for messages)
+	Ephemeral bool   `json:"ephemeral,omitempty"` // Can be bulk-deleted when closed
+	// NOTE: RepliesTo, RelatesTo, DuplicateOf, SupersededBy moved to dependencies table
+	// per Decision 004 (Edge Schema Consolidation). Use dependency API instead.
+
+	// Pinned field (bd-7h5): persistent context markers
+	Pinned bool `json:"pinned,omitempty"` // If true, issue is a persistent context marker, not a work item
 }
 
 // ComputeContentHash creates a deterministic hash of the issue's content.
@@ -70,7 +79,11 @@ func (i *Issue) ComputeContentHash() string {
 	if i.ExternalRef != nil {
 		h.Write([]byte(*i.ExternalRef))
 	}
-	
+	h.Write([]byte{0})
+	if i.Pinned {
+		h.Write([]byte("pinned"))
+	}
+
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
@@ -90,7 +103,10 @@ func (i *Issue) IsTombstone() bool {
 
 // IsExpired returns true if the tombstone has exceeded its TTL.
 // Non-tombstone issues always return false.
-// ttl is the configured TTL duration; if zero, DefaultTombstoneTTL is used.
+// ttl is the configured TTL duration:
+//   - If zero, DefaultTombstoneTTL (30 days) is used
+//   - If negative, the tombstone is immediately expired (for --hard mode)
+//   - If positive, ClockSkewGrace is added only for TTLs > 1 hour
 func (i *Issue) IsExpired(ttl time.Duration) bool {
 	// Non-tombstones never expire
 	if !i.IsTombstone() {
@@ -102,13 +118,22 @@ func (i *Issue) IsExpired(ttl time.Duration) bool {
 		return false
 	}
 
+	// Negative TTL means "immediately expired" - for --hard mode (bd-4q8 fix)
+	if ttl < 0 {
+		return true
+	}
+
 	// Use default TTL if not specified
 	if ttl == 0 {
 		ttl = DefaultTombstoneTTL
 	}
 
-	// Add clock skew grace period to the TTL
-	effectiveTTL := ttl + ClockSkewGrace
+	// Only add clock skew grace period for normal TTLs (> 1 hour).
+	// For short TTLs (testing/development), skip grace period.
+	effectiveTTL := ttl
+	if ttl > ClockSkewGrace {
+		effectiveTTL = ttl + ClockSkewGrace
+	}
 
 	// Check if the tombstone has exceeded its TTL
 	expirationTime := i.DeletedAt.Add(effectiveTTL)
@@ -168,12 +193,13 @@ const (
 	StatusBlocked    Status = "blocked"
 	StatusClosed     Status = "closed"
 	StatusTombstone  Status = "tombstone" // Soft-deleted issue (bd-vw8)
+	StatusPinned     Status = "pinned"    // Persistent bead that stays open indefinitely (bd-6v2)
 )
 
 // IsValid checks if the status value is valid (built-in statuses only)
 func (s Status) IsValid() bool {
 	switch s {
-	case StatusOpen, StatusInProgress, StatusBlocked, StatusClosed, StatusTombstone:
+	case StatusOpen, StatusInProgress, StatusBlocked, StatusClosed, StatusTombstone, StatusPinned:
 		return true
 	}
 	return false
@@ -200,17 +226,19 @@ type IssueType string
 
 // Issue type constants
 const (
-	TypeBug     IssueType = "bug"
-	TypeFeature IssueType = "feature"
-	TypeTask    IssueType = "task"
-	TypeEpic    IssueType = "epic"
-	TypeChore   IssueType = "chore"
+	TypeBug          IssueType = "bug"
+	TypeFeature      IssueType = "feature"
+	TypeTask         IssueType = "task"
+	TypeEpic         IssueType = "epic"
+	TypeChore        IssueType = "chore"
+	TypeMessage      IssueType = "message"       // Ephemeral communication between workers
+	TypeMergeRequest IssueType = "merge-request" // Merge queue entry for refinery processing
 )
 
 // IsValid checks if the issue type value is valid
 func (t IssueType) IsValid() bool {
 	switch t {
-	case TypeBug, TypeFeature, TypeTask, TypeEpic, TypeChore:
+	case TypeBug, TypeFeature, TypeTask, TypeEpic, TypeChore, TypeMessage, TypeMergeRequest:
 		return true
 	}
 	return false
@@ -223,6 +251,12 @@ type Dependency struct {
 	Type        DependencyType `json:"type"`
 	CreatedAt   time.Time      `json:"created_at"`
 	CreatedBy   string         `json:"created_by"`
+	// Metadata contains type-specific edge data (JSON blob)
+	// Examples: similarity scores, approval details, skill proficiency
+	Metadata string `json:"metadata,omitempty"`
+	// ThreadID groups conversation edges for efficient thread queries
+	// For replies-to edges, this identifies the conversation root
+	ThreadID string `json:"thread_id,omitempty"`
 }
 
 // DependencyCounts holds counts for dependencies and dependents
@@ -250,19 +284,49 @@ type DependencyType string
 
 // Dependency type constants
 const (
-	DepBlocks         DependencyType = "blocks"
+	// Workflow types (affect ready work calculation)
+	DepBlocks      DependencyType = "blocks"
+	DepParentChild DependencyType = "parent-child"
+
+	// Association types
 	DepRelated        DependencyType = "related"
-	DepParentChild    DependencyType = "parent-child"
 	DepDiscoveredFrom DependencyType = "discovered-from"
+
+	// Graph link types (bd-kwro)
+	DepRepliesTo  DependencyType = "replies-to"  // Conversation threading
+	DepRelatesTo  DependencyType = "relates-to"  // Loose knowledge graph edges
+	DepDuplicates DependencyType = "duplicates"  // Deduplication link
+	DepSupersedes DependencyType = "supersedes"  // Version chain link
+
+	// Entity types (HOP foundation - Decision 004)
+	DepAuthoredBy DependencyType = "authored-by" // Creator relationship
+	DepAssignedTo DependencyType = "assigned-to" // Assignment relationship
+	DepApprovedBy DependencyType = "approved-by" // Approval relationship
 )
 
-// IsValid checks if the dependency type value is valid
+// IsValid checks if the dependency type value is valid.
+// Accepts any non-empty string up to 50 characters.
+// Use IsWellKnown() to check if it's a built-in type.
 func (d DependencyType) IsValid() bool {
+	return len(d) > 0 && len(d) <= 50
+}
+
+// IsWellKnown checks if the dependency type is a well-known constant.
+// Returns false for custom/user-defined types (which are still valid).
+func (d DependencyType) IsWellKnown() bool {
 	switch d {
-	case DepBlocks, DepRelated, DepParentChild, DepDiscoveredFrom:
+	case DepBlocks, DepParentChild, DepRelated, DepDiscoveredFrom,
+		DepRepliesTo, DepRelatesTo, DepDuplicates, DepSupersedes,
+		DepAuthoredBy, DepAssignedTo, DepApprovedBy:
 		return true
 	}
 	return false
+}
+
+// AffectsReadyWork returns true if this dependency type blocks work.
+// Only "blocks" and "parent-child" relationships affect the ready work calculation.
+func (d DependencyType) AffectsReadyWork() bool {
+	return d == DepBlocks || d == DepParentChild
 }
 
 // Label represents a tag on an issue
@@ -334,6 +398,7 @@ type Statistics struct {
 	BlockedIssues            int     `json:"blocked_issues"`
 	ReadyIssues              int     `json:"ready_issues"`
 	TombstoneIssues          int     `json:"tombstone_issues"` // Soft-deleted issues (bd-nyt)
+	PinnedIssues             int     `json:"pinned_issues"`    // Persistent issues (bd-6v2)
 	EpicsEligibleForClosure  int     `json:"epics_eligible_for_closure"`
 	AverageLeadTime          float64 `json:"average_lead_time_hours"`
 }
@@ -374,6 +439,12 @@ type IssueFilter struct {
 
 	// Tombstone filtering (bd-1bu)
 	IncludeTombstones bool // If false (default), exclude tombstones from results
+
+	// Ephemeral filtering (bd-kwro.9)
+	Ephemeral *bool // Filter by ephemeral flag (nil = any, true = only ephemeral, false = only non-ephemeral)
+
+	// Pinned filtering (bd-7h5)
+	Pinned *bool // Filter by pinned flag (nil = any, true = only pinned, false = only non-pinned)
 }
 
 // SortPolicy determines how ready work is ordered
@@ -407,6 +478,7 @@ func (s SortPolicy) IsValid() bool {
 // WorkFilter is used to filter ready work queries
 type WorkFilter struct {
 	Status     Status
+	Type       string     // Filter by issue type (task, bug, feature, epic, merge-request, etc.)
 	Priority   *int
 	Assignee   *string
 	Unassigned bool       // Filter for issues with no assignee

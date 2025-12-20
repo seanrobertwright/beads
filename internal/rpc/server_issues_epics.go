@@ -1,6 +1,7 @@
 package rpc
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -76,6 +77,30 @@ func updatesFromArgs(a UpdateArgs) map[string]interface{} {
 	if a.IssueType != nil {
 		u["issue_type"] = *a.IssueType
 	}
+	// Messaging fields (bd-kwro)
+	if a.Sender != nil {
+		u["sender"] = *a.Sender
+	}
+	if a.Ephemeral != nil {
+		u["ephemeral"] = *a.Ephemeral
+	}
+	if a.RepliesTo != nil {
+		u["replies_to"] = *a.RepliesTo
+	}
+	// Graph link fields (bd-fu83)
+	if a.RelatesTo != nil {
+		u["relates_to"] = *a.RelatesTo
+	}
+	if a.DuplicateOf != nil {
+		u["duplicate_of"] = *a.DuplicateOf
+	}
+	if a.SupersededBy != nil {
+		u["superseded_by"] = *a.SupersededBy
+	}
+	// Pinned field (bd-iea)
+	if a.Pinned != nil {
+		u["pinned"] = *a.Pinned
+	}
 	return u
 }
 
@@ -150,6 +175,10 @@ func (s *Server) handleCreate(req *Request) Response {
 		ExternalRef:        externalRef,
 		EstimatedMinutes:   createArgs.EstimatedMinutes,
 		Status:             types.StatusOpen,
+		// Messaging fields (bd-kwro)
+		Sender:    createArgs.Sender,
+		Ephemeral: createArgs.Ephemeral,
+		// NOTE: RepliesTo now handled via replies-to dependency (Decision 004)
 	}
 	
 	// Check if any dependencies are discovered-from type
@@ -205,6 +234,22 @@ func (s *Server) handleCreate(req *Request) Response {
 			return Response{
 				Success: false,
 				Error:   fmt.Sprintf("failed to add parent-child dependency %s -> %s: %v", issue.ID, createArgs.Parent, err),
+			}
+		}
+	}
+
+	// If RepliesTo was specified, add replies-to dependency (Decision 004)
+	if createArgs.RepliesTo != "" {
+		dep := &types.Dependency{
+			IssueID:     issue.ID,
+			DependsOnID: createArgs.RepliesTo,
+			Type:        types.DepRepliesTo,
+			ThreadID:    createArgs.RepliesTo, // Use parent ID as thread root
+		}
+		if err := store.AddDependency(ctx, dep, s.reqActor(req)); err != nil {
+			return Response{
+				Success: false,
+				Error:   fmt.Sprintf("failed to add replies-to dependency %s -> %s: %v", issue.ID, createArgs.RepliesTo, err),
 			}
 		}
 	}
@@ -467,10 +512,26 @@ func (s *Server) handleDelete(req *Request) Response {
 			continue
 		}
 
-		// Delete the issue
-		if err := store.DeleteIssue(ctx, issueID); err != nil {
-			errors = append(errors, fmt.Sprintf("%s: %v", issueID, err))
-			continue
+		// Create tombstone instead of hard delete (bd-rp4o fix)
+		// This preserves deletion history and prevents resurrection during sync
+		type tombstoner interface {
+			CreateTombstone(ctx context.Context, id string, actor string, reason string) error
+		}
+		if t, ok := store.(tombstoner); ok {
+			reason := deleteArgs.Reason
+			if reason == "" {
+				reason = "deleted via daemon"
+			}
+			if err := t.CreateTombstone(ctx, issueID, "daemon", reason); err != nil {
+				errors = append(errors, fmt.Sprintf("%s: %v", issueID, err))
+				continue
+			}
+		} else {
+			// Fallback to hard delete if CreateTombstone not available
+			if err := store.DeleteIssue(ctx, issueID); err != nil {
+				errors = append(errors, fmt.Sprintf("%s: %v", issueID, err))
+				continue
+			}
 		}
 
 		// Emit mutation event for event-driven daemon
@@ -636,6 +697,9 @@ func (s *Server) handleList(req *Request) Response {
 	// Priority range
 	filter.PriorityMin = listArgs.PriorityMin
 	filter.PriorityMax = listArgs.PriorityMax
+
+	// Pinned filtering (bd-p8e)
+	filter.Pinned = listArgs.Pinned
 
 	// Guard against excessive ID lists to avoid SQLite parameter limits
 	const maxIDs = 1000

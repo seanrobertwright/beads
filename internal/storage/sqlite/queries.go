@@ -11,6 +11,11 @@ import (
 	"github.com/steveyegge/beads/internal/types"
 )
 
+// NOTE: createGraphEdgesFromIssueFields and createGraphEdgesFromUpdates removed
+// per Decision 004 Phase 4 - Edge Schema Consolidation.
+// Graph edges (replies-to, relates-to, duplicates, supersedes) are now managed
+// exclusively through the dependency API. Use AddDependency() instead.
+
 // parseNullableTimeString parses a nullable time string from database TEXT columns.
 // The ncruces/go-sqlite3 driver only auto-converts TEXT→time.Time for columns declared
 // as DATETIME/DATE/TIME/TIMESTAMP. For TEXT columns (like deleted_at), we must parse manually.
@@ -26,6 +31,32 @@ func parseNullableTimeString(ns sql.NullString) *time.Time {
 		}
 	}
 	return nil // Unparseable - shouldn't happen with valid data
+}
+
+// parseJSONStringArray parses a JSON string array from database TEXT column.
+// Returns empty slice if the string is empty or invalid JSON.
+func parseJSONStringArray(s string) []string {
+	if s == "" {
+		return nil
+	}
+	var result []string
+	if err := json.Unmarshal([]byte(s), &result); err != nil {
+		return nil // Invalid JSON - shouldn't happen with valid data
+	}
+	return result
+}
+
+// formatJSONStringArray formats a string slice as JSON for database storage.
+// Returns empty string if the slice is nil or empty.
+func formatJSONStringArray(arr []string) string {
+	if len(arr) == 0 {
+		return ""
+	}
+	data, err := json.Marshal(arr)
+	if err != nil {
+		return ""
+	}
+	return string(data)
 }
 
 // REMOVED (bd-8e05): getNextIDForPrefix and AllocateNextID - sequential ID generation
@@ -172,6 +203,9 @@ func (s *SQLiteStorage) CreateIssue(ctx context.Context, issue *types.Issue, act
 		return wrapDBError("record creation event", err)
 	}
 
+	// NOTE: Graph edges (replies-to, relates-to, duplicates, supersedes) are now
+	// managed via AddDependency() per Decision 004 Phase 4.
+
 	// Mark issue as dirty for incremental export
 	if err := markDirty(ctx, conn, issue.ID); err != nil {
 		return wrapDBError("mark issue dirty", err)
@@ -193,6 +227,11 @@ func (s *SQLiteStorage) GetIssue(ctx context.Context, id string) (*types.Issue, 
 	// Check for external database file modifications (daemon mode)
 	s.checkFreshness()
 
+	// Hold read lock during database operations to prevent reconnect() from
+	// closing the connection mid-query (GH#607 race condition fix)
+	s.reconnectMu.RLock()
+	defer s.reconnectMu.RUnlock()
+
 	var issue types.Issue
 	var closedAt sql.NullTime
 	var estimatedMinutes sql.NullInt64
@@ -206,6 +245,11 @@ func (s *SQLiteStorage) GetIssue(ctx context.Context, id string) (*types.Issue, 
 	var deletedBy sql.NullString
 	var deleteReason sql.NullString
 	var originalType sql.NullString
+	// Messaging fields (bd-kwro)
+	var sender sql.NullString
+	var ephemeral sql.NullInt64
+	// Pinned field (bd-7h5)
+	var pinned sql.NullInt64
 
 	var contentHash sql.NullString
 	var compactedAtCommit sql.NullString
@@ -214,7 +258,8 @@ func (s *SQLiteStorage) GetIssue(ctx context.Context, id string) (*types.Issue, 
 		       status, priority, issue_type, assignee, estimated_minutes,
 		       created_at, updated_at, closed_at, external_ref,
 		       compaction_level, compacted_at, compacted_at_commit, original_size, source_repo, close_reason,
-		       deleted_at, deleted_by, delete_reason, original_type
+		       deleted_at, deleted_by, delete_reason, original_type,
+		       sender, ephemeral, pinned
 		FROM issues
 		WHERE id = ?
 	`, id).Scan(
@@ -224,6 +269,7 @@ func (s *SQLiteStorage) GetIssue(ctx context.Context, id string) (*types.Issue, 
 		&issue.CreatedAt, &issue.UpdatedAt, &closedAt, &externalRef,
 		&issue.CompactionLevel, &compactedAt, &compactedAtCommit, &originalSize, &sourceRepo, &closeReason,
 		&deletedAt, &deletedBy, &deleteReason, &originalType,
+		&sender, &ephemeral, &pinned,
 	)
 
 	if err == sql.ErrNoRows {
@@ -273,6 +319,17 @@ func (s *SQLiteStorage) GetIssue(ctx context.Context, id string) (*types.Issue, 
 	}
 	if originalType.Valid {
 		issue.OriginalType = originalType.String
+	}
+	// Messaging fields (bd-kwro)
+	if sender.Valid {
+		issue.Sender = sender.String
+	}
+	if ephemeral.Valid && ephemeral.Int64 != 0 {
+		issue.Ephemeral = true
+	}
+	// Pinned field (bd-7h5)
+	if pinned.Valid && pinned.Int64 != 0 {
+		issue.Pinned = true
 	}
 
 	// Fetch labels for this issue
@@ -377,13 +434,19 @@ func (s *SQLiteStorage) GetIssueByExternalRef(ctx context.Context, externalRef s
 	var deletedBy sql.NullString
 	var deleteReason sql.NullString
 	var originalType sql.NullString
+	// Messaging fields (bd-kwro)
+	var sender sql.NullString
+	var ephemeral sql.NullInt64
+	// Pinned field (bd-7h5)
+	var pinned sql.NullInt64
 
 	err := s.db.QueryRowContext(ctx, `
 		SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
 		       status, priority, issue_type, assignee, estimated_minutes,
 		       created_at, updated_at, closed_at, external_ref,
 		       compaction_level, compacted_at, compacted_at_commit, original_size, source_repo, close_reason,
-		       deleted_at, deleted_by, delete_reason, original_type
+		       deleted_at, deleted_by, delete_reason, original_type,
+		       sender, ephemeral, pinned
 		FROM issues
 		WHERE external_ref = ?
 	`, externalRef).Scan(
@@ -393,6 +456,7 @@ func (s *SQLiteStorage) GetIssueByExternalRef(ctx context.Context, externalRef s
 		&issue.CreatedAt, &issue.UpdatedAt, &closedAt, &externalRefCol,
 		&issue.CompactionLevel, &compactedAt, &compactedAtCommit, &originalSize, &sourceRepo, &closeReason,
 		&deletedAt, &deletedBy, &deleteReason, &originalType,
+		&sender, &ephemeral, &pinned,
 	)
 
 	if err == sql.ErrNoRows {
@@ -443,6 +507,17 @@ func (s *SQLiteStorage) GetIssueByExternalRef(ctx context.Context, externalRef s
 	if originalType.Valid {
 		issue.OriginalType = originalType.String
 	}
+	// Messaging fields (bd-kwro)
+	if sender.Valid {
+		issue.Sender = sender.String
+	}
+	if ephemeral.Valid && ephemeral.Int64 != 0 {
+		issue.Ephemeral = true
+	}
+	// Pinned field (bd-7h5)
+	if pinned.Valid && pinned.Int64 != 0 {
+		issue.Pinned = true
+	}
 
 	// Fetch labels for this issue
 	labels, err := s.GetLabels(ctx, issue.ID)
@@ -468,6 +543,11 @@ var allowedUpdateFields = map[string]bool{
 	"estimated_minutes":   true,
 	"external_ref":        true,
 	"closed_at":           true,
+	// Messaging fields (bd-kwro)
+	"sender":    true,
+	"ephemeral": true,
+	// NOTE: replies_to, relates_to, duplicate_of, superseded_by removed per Decision 004
+	// Use AddDependency() to create graph edges instead
 }
 
 // validatePriority validates a priority value
@@ -684,6 +764,8 @@ func (s *SQLiteStorage) UpdateIssue(ctx context.Context, id string, updates map[
 	if err != nil {
 		return fmt.Errorf("failed to record event: %w", err)
 	}
+
+	// NOTE: Graph edges now managed via AddDependency() per Decision 004 Phase 4.
 
 	// Mark issue as dirty for incremental export
 	_, err = tx.ExecContext(ctx, `
@@ -1335,6 +1417,11 @@ func (s *SQLiteStorage) SearchIssues(ctx context.Context, query string, filter t
 	// Check for external database file modifications (daemon mode)
 	s.checkFreshness()
 
+	// Hold read lock during database operations to prevent reconnect() from
+	// closing the connection mid-query (GH#607 race condition fix)
+	s.reconnectMu.RLock()
+	defer s.reconnectMu.RUnlock()
+
 	whereClauses := []string{}
 	args := []interface{}{}
 
@@ -1463,6 +1550,24 @@ func (s *SQLiteStorage) SearchIssues(ctx context.Context, query string, filter t
 		whereClauses = append(whereClauses, fmt.Sprintf("id IN (%s)", strings.Join(placeholders, ", ")))
 	}
 
+	// Ephemeral filtering (bd-kwro.9)
+	if filter.Ephemeral != nil {
+		if *filter.Ephemeral {
+			whereClauses = append(whereClauses, "ephemeral = 1")
+		} else {
+			whereClauses = append(whereClauses, "(ephemeral = 0 OR ephemeral IS NULL)")
+		}
+	}
+
+	// Pinned filtering (bd-7h5)
+	if filter.Pinned != nil {
+		if *filter.Pinned {
+			whereClauses = append(whereClauses, "pinned = 1")
+		} else {
+			whereClauses = append(whereClauses, "(pinned = 0 OR pinned IS NULL)")
+		}
+	}
+
 	whereSQL := ""
 	if len(whereClauses) > 0 {
 		whereSQL = "WHERE " + strings.Join(whereClauses, " AND ")
@@ -1479,7 +1584,8 @@ func (s *SQLiteStorage) SearchIssues(ctx context.Context, query string, filter t
 		SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
 		       status, priority, issue_type, assignee, estimated_minutes,
 		       created_at, updated_at, closed_at, external_ref, source_repo, close_reason,
-		       deleted_at, deleted_by, delete_reason, original_type
+		       deleted_at, deleted_by, delete_reason, original_type,
+		       sender, ephemeral, pinned
 		FROM issues
 		%s
 		ORDER BY priority ASC, created_at DESC

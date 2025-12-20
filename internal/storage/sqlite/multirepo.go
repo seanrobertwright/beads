@@ -257,6 +257,15 @@ func (s *SQLiteStorage) upsertIssueInTx(ctx context.Context, tx *sql.Tx, issue *
 	var existingID string
 	err := tx.QueryRowContext(ctx, `SELECT id FROM issues WHERE id = ?`, issue.ID).Scan(&existingID)
 
+	ephemeral := 0
+	if issue.Ephemeral {
+		ephemeral = 1
+	}
+	pinned := 0
+	if issue.Pinned {
+		pinned = 1
+	}
+
 	if err == sql.ErrNoRows {
 		// Issue doesn't exist - insert it
 		_, err = tx.ExecContext(ctx, `
@@ -264,8 +273,9 @@ func (s *SQLiteStorage) upsertIssueInTx(ctx context.Context, tx *sql.Tx, issue *
 				id, content_hash, title, description, design, acceptance_criteria, notes,
 				status, priority, issue_type, assignee, estimated_minutes,
 				created_at, updated_at, closed_at, external_ref, source_repo, close_reason,
-				deleted_at, deleted_by, delete_reason, original_type
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				deleted_at, deleted_by, delete_reason, original_type,
+				sender, ephemeral, pinned
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		`,
 			issue.ID, issue.ContentHash, issue.Title, issue.Description, issue.Design,
 			issue.AcceptanceCriteria, issue.Notes, issue.Status,
@@ -273,6 +283,7 @@ func (s *SQLiteStorage) upsertIssueInTx(ctx context.Context, tx *sql.Tx, issue *
 			issue.EstimatedMinutes, issue.CreatedAt, issue.UpdatedAt,
 			issue.ClosedAt, issue.ExternalRef, issue.SourceRepo, issue.CloseReason,
 			issue.DeletedAt, issue.DeletedBy, issue.DeleteReason, issue.OriginalType,
+			issue.Sender, ephemeral, pinned,
 		)
 		if err != nil {
 			return fmt.Errorf("failed to insert issue: %w", err)
@@ -295,7 +306,8 @@ func (s *SQLiteStorage) upsertIssueInTx(ctx context.Context, tx *sql.Tx, issue *
 					acceptance_criteria = ?, notes = ?, status = ?, priority = ?,
 					issue_type = ?, assignee = ?, estimated_minutes = ?,
 					updated_at = ?, closed_at = ?, external_ref = ?, source_repo = ?,
-					deleted_at = ?, deleted_by = ?, delete_reason = ?, original_type = ?
+					deleted_at = ?, deleted_by = ?, delete_reason = ?, original_type = ?,
+					sender = ?, ephemeral = ?, pinned = ?
 				WHERE id = ?
 			`,
 				issue.ContentHash, issue.Title, issue.Description, issue.Design,
@@ -303,6 +315,7 @@ func (s *SQLiteStorage) upsertIssueInTx(ctx context.Context, tx *sql.Tx, issue *
 				issue.IssueType, issue.Assignee, issue.EstimatedMinutes,
 				issue.UpdatedAt, issue.ClosedAt, issue.ExternalRef, issue.SourceRepo,
 				issue.DeletedAt, issue.DeletedBy, issue.DeleteReason, issue.OriginalType,
+				issue.Sender, ephemeral, pinned,
 				issue.ID,
 			)
 			if err != nil {

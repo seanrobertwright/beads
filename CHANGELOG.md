@@ -7,6 +7,137 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.30.6] - 2025-12-18
+
+### Added
+
+- **`bd graph` dependency counts** (bd-6v2) - Graph command shows dependency counts using subgraph formatting
+- **`types.StatusPinned`** - New status for persistent beads that survive cleanup
+
+### Fixed
+
+- **CRITICAL: Dependency resurrection bug** (bd-ndye) - Fixed 3-way merge to respect dependency removals
+  - `mergeDependencies` was using union (additive-only) instead of proper 3-way merge
+  - Now removals are authoritative: if either left or right removes a dep, it stays removed
+  - This prevented orphaned parent-child relationships from being permanently removed
+
+## [0.30.5] - 2025-12-18
+
+### Removed
+
+- **YAML simple template system** - Removed `--from-template` flag from `bd create`
+  - Deleted embedded templates: `bug.yaml`, `epic.yaml`, `feature.yaml`
+  - Templates are now purely Beads-based (epics with `template` label)
+  - Use `bd template instantiate <id>` for template workflows
+
+## [0.30.4] - 2025-12-18
+
+### Added
+
+- **`bd template instantiate`** (bd-r6a.2) - Create beads issues from YAML workflow templates
+  - `bd template instantiate <file.yaml>` - Create issues from workflow definitions
+  - `--assignee <identity>` flag for auto-assignment during instantiation
+  - Supports multi-issue workflows with dependency chains
+  - Templates define issue properties (title, type, priority, dependencies)
+
+### Changed
+
+- **`bd mail inbox --identity`** - Fixed to properly filter by identity parameter
+
+### Fixed
+
+- **Orphan detection warnings** - No longer warns about closed issues or tombstones
+  - Previously `bd doctor` reported false positives for completed dependencies
+
+### Removed
+
+- **Legacy MCP Agent Mail integration** (bd-6gd) - Removed obsolete `mcp_agents` package
+- **YAML workflow execution system** (bd-r6a.1) - Replaced by simpler template instantiation
+
+### Notes
+
+- **Experimental edges**: The new graph link fields (`relates_to`, `replies_to`, `duplicate_of`, `superseded_by`) and mail commands are **experimental and subject to change** in upcoming releases. Early adopters should expect breaking changes to these APIs.
+
+## [0.30.3] - 2025-12-17
+
+### Fixed
+
+- **Data loss race condition** (bd-b6xo) - Removed unsafe `ClearDirtyIssues()` method
+  - Old method cleared ALL dirty issues, risking data loss if export failed partway
+  - All code now uses `ClearDirtyIssuesByID()` which only clears exported issues
+  - Affects: `internal/storage/sqlite/dirty.go`, `internal/storage/memory/memory.go`
+
+### Closed (Already Implemented)
+
+- **Stale database warning** (bd-2q6d) - Commands now warn when database is out of sync with JSONL
+- **Staleness check error handling** (bd-n4td, bd-o4qy) - Proper warnings and error returns
+
+## [0.30.2] - 2025-12-16
+
+### Added
+
+- **`bd setup droid`** (GH#598) - Factory.ai (Droid) IDE support
+  - Configure beads for use with Factory.ai's Droid
+  - Contributed by @jordanhubbard
+
+- **Messaging schema fields** (bd-kwro.1) - Foundation for inter-agent messaging
+  - New `message` issue type for agent-to-agent communication
+  - New fields: `sender`, `ephemeral`, `replies_to`, `relates_to`, `duplicate_of`, `superseded_by`
+  - New dependency types: `replies-to`, `relates-to`, `duplicates`, `supersedes`
+  - Schema migration 019 (automatic on first use)
+
+- **`bd mail` commands** (bd-kwro.6) - Inter-agent messaging
+  - `bd mail send <recipient> -s <subject> -m <body>` - Send messages
+  - `bd mail inbox` - List open messages for your identity
+  - `bd mail read <id>` - Display message content
+  - `bd mail ack <id>` - Acknowledge (close) messages
+  - `bd mail reply <id> -m <body>` - Reply to messages (creates threads)
+  - Identity via `BEADS_IDENTITY` env var or `.beads/config.json`
+
+- **Graph link commands** (bd-kwro.2-5) - Knowledge graph relationships
+  - `bd relate <id1> <id2>` - Create bidirectional "see also" links
+  - `bd unrelate <id1> <id2>` - Remove relates_to links
+  - `bd duplicate <id> --of <canonical>` - Mark issue as duplicate (closes it)
+  - `bd supersede <old> --with <new>` - Mark issue as superseded (closes it)
+  - `bd show --thread` - View message threads via replies_to chain
+
+- **Hooks system** (bd-kwro.8) - Extensible event notifications
+  - `.beads/hooks/on_create` - Runs after issue creation
+  - `.beads/hooks/on_update` - Runs after issue update
+  - `.beads/hooks/on_close` - Runs after issue close
+  - `.beads/hooks/on_message` - Runs after message send
+  - Hooks receive issue ID, event type as args, full JSON on stdin
+
+- **`bd cleanup --ephemeral` flag** (bd-kwro.9) - Clean up transient messages
+  - Deletes only closed issues with `ephemeral=true`
+  - Useful for cleaning up messages after swarms complete
+
+### Fixed
+
+- **Windows build errors** (GH#585) - Fixed gosec lint warnings
+  - Contributed by @deblasis
+
+- **Issue ID prefix extraction** - Word-like suffixes (e.g., `my-project-audit`) now parse correctly
+  - Previously could incorrectly split on word boundaries
+
+### Removed
+
+- **Legacy deletions.jsonl code** (bd-fom) - Fully migrated to inline tombstones
+  - Removed `deletions.jsonl` from git tracking
+  - All deletion tracking now via inline tombstones in `issues.jsonl`
+
+### Documentation
+
+- **Messaging documentation** (bd-kwro.11) - New docs for messaging system
+  - `docs/messaging.md` - Full messaging reference with examples
+  - `docs/graph-links.md` - Graph link types and use cases
+  - Updated `AGENTS.md` with inter-agent messaging section
+
+- Windows installation command in upgrade instructions (GH#589)
+  - Contributed by @alexx-ftw
+
+- Aligned `bd prime` guidance with skill's hybrid TodoWrite approach
+
 ## [0.30.1] - 2025-12-16
 
 ### Added

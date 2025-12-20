@@ -8,9 +8,58 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/steveyegge/beads/internal/deletions"
 	"github.com/steveyegge/beads/internal/types"
 )
+
+// legacyDeletionRecord represents a single deletion entry from the legacy deletions.jsonl manifest.
+// This is inlined here for migration purposes only - new code uses inline tombstones.
+type legacyDeletionRecord struct {
+	ID        string    `json:"id"`               // Issue ID that was deleted
+	Timestamp time.Time `json:"ts"`               // When the deletion occurred
+	Actor     string    `json:"by"`               // Who performed the deletion
+	Reason    string    `json:"reason,omitempty"` // Optional reason for deletion
+}
+
+// loadLegacyDeletions reads the legacy deletions.jsonl manifest.
+// Returns a map of deletion records keyed by issue ID.
+// This is inlined here for migration purposes only.
+func loadLegacyDeletions(path string) (map[string]legacyDeletionRecord, error) {
+	records := make(map[string]legacyDeletionRecord)
+
+	f, err := os.Open(path) // #nosec G304 - controlled path from caller
+	if err != nil {
+		if os.IsNotExist(err) {
+			return records, nil
+		}
+		return nil, fmt.Errorf("failed to open deletions file: %w", err)
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 1024), 1024*1024)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+
+		var record legacyDeletionRecord
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			continue // Skip corrupt lines
+		}
+		if record.ID == "" {
+			continue // Skip records without ID
+		}
+		records[record.ID] = record
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("error reading deletions file: %w", err)
+	}
+
+	return records, nil
+}
 
 // MigrateTombstones converts legacy deletions.jsonl entries to inline tombstones.
 // This is called by bd doctor --fix when legacy deletions are detected.
@@ -30,19 +79,19 @@ func MigrateTombstones(path string) error {
 	}
 
 	// Load deletions
-	loadResult, err := deletions.LoadDeletions(deletionsPath)
+	records, err := loadLegacyDeletions(deletionsPath)
 	if err != nil {
 		return fmt.Errorf("failed to load deletions: %w", err)
 	}
 
-	if len(loadResult.Records) == 0 {
+	if len(records) == 0 {
 		fmt.Println("  deletions.jsonl is empty - nothing to migrate")
 		return nil
 	}
 
 	// Load existing JSONL to check for already-existing tombstones
 	existingTombstones := make(map[string]bool)
-	if file, err := os.Open(jsonlPath); err == nil {
+	if file, err := os.Open(filepath.Clean(jsonlPath)); err == nil {
 		scanner := bufio.NewScanner(file)
 		scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
 		for scanner.Scan() {
@@ -56,13 +105,13 @@ func MigrateTombstones(path string) error {
 				}
 			}
 		}
-		file.Close()
+		_ = file.Close()
 	}
 
 	// Convert deletions to tombstones
-	var toMigrate []deletions.DeletionRecord
+	var toMigrate []legacyDeletionRecord
 	var skipped int
-	for _, record := range loadResult.Records {
+	for _, record := range records {
 		if existingTombstones[record.ID] {
 			skipped++
 			continue
@@ -74,14 +123,14 @@ func MigrateTombstones(path string) error {
 		fmt.Printf("  All %d deletion(s) already have tombstones - archiving deletions.jsonl\n", skipped)
 	} else {
 		// Append tombstones to issues.jsonl
-		file, err := os.OpenFile(jsonlPath, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
+		file, err := os.OpenFile(filepath.Clean(jsonlPath), os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
 		if err != nil {
 			return fmt.Errorf("failed to open issues.jsonl: %w", err)
 		}
 		defer file.Close()
 
 		for _, record := range toMigrate {
-			tombstone := convertDeletionToTombstone(record)
+			tombstone := convertLegacyDeletionToTombstone(record)
 			data, err := json.Marshal(tombstone)
 			if err != nil {
 				return fmt.Errorf("failed to marshal tombstone for %s: %w", record.ID, err)
@@ -106,8 +155,8 @@ func MigrateTombstones(path string) error {
 	return nil
 }
 
-// convertDeletionToTombstone converts a DeletionRecord to a tombstone Issue.
-func convertDeletionToTombstone(record deletions.DeletionRecord) *types.Issue {
+// convertLegacyDeletionToTombstone converts a legacy DeletionRecord to a tombstone Issue.
+func convertLegacyDeletionToTombstone(record legacyDeletionRecord) *types.Issue {
 	now := time.Now()
 	deletedAt := record.Timestamp
 	if deletedAt.IsZero() {

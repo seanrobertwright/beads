@@ -4,9 +4,21 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 
 	"github.com/steveyegge/beads/internal/types"
 )
+
+// isUniqueConstraintError checks if error is a UNIQUE constraint violation
+// Used to detect and handle duplicate IDs in JSONL imports gracefully
+func isUniqueConstraintError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errMsg := err.Error()
+	return strings.Contains(errMsg, "UNIQUE constraint failed") ||
+		strings.Contains(errMsg, "constraint failed: UNIQUE")
+}
 
 // insertIssue inserts a single issue into the database
 func insertIssue(ctx context.Context, conn *sql.Conn, issue *types.Issue) error {
@@ -15,13 +27,23 @@ func insertIssue(ctx context.Context, conn *sql.Conn, issue *types.Issue) error 
 		sourceRepo = "." // Default to primary repo
 	}
 
+	ephemeral := 0
+	if issue.Ephemeral {
+		ephemeral = 1
+	}
+	pinned := 0
+	if issue.Pinned {
+		pinned = 1
+	}
+
 	_, err := conn.ExecContext(ctx, `
-		INSERT INTO issues (
+		INSERT OR IGNORE INTO issues (
 			id, content_hash, title, description, design, acceptance_criteria, notes,
 			status, priority, issue_type, assignee, estimated_minutes,
 			created_at, updated_at, closed_at, external_ref, source_repo, close_reason,
-			deleted_at, deleted_by, delete_reason, original_type
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			deleted_at, deleted_by, delete_reason, original_type,
+			sender, ephemeral, pinned
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		issue.ID, issue.ContentHash, issue.Title, issue.Description, issue.Design,
 		issue.AcceptanceCriteria, issue.Notes, issue.Status,
@@ -29,9 +51,15 @@ func insertIssue(ctx context.Context, conn *sql.Conn, issue *types.Issue) error 
 		issue.EstimatedMinutes, issue.CreatedAt, issue.UpdatedAt,
 		issue.ClosedAt, issue.ExternalRef, sourceRepo, issue.CloseReason,
 		issue.DeletedAt, issue.DeletedBy, issue.DeleteReason, issue.OriginalType,
+		issue.Sender, ephemeral, pinned,
 	)
 	if err != nil {
-		return fmt.Errorf("failed to insert issue: %w", err)
+		// INSERT OR IGNORE should handle duplicates, but driver may still return error
+		// Explicitly ignore UNIQUE constraint errors (expected for duplicate IDs in JSONL)
+		if !isUniqueConstraintError(err) {
+			return fmt.Errorf("failed to insert issue: %w", err)
+		}
+		// Duplicate ID detected and ignored (INSERT OR IGNORE succeeded)
 	}
 	return nil
 }
@@ -39,12 +67,13 @@ func insertIssue(ctx context.Context, conn *sql.Conn, issue *types.Issue) error 
 // insertIssues bulk inserts multiple issues using a prepared statement
 func insertIssues(ctx context.Context, conn *sql.Conn, issues []*types.Issue) error {
 	stmt, err := conn.PrepareContext(ctx, `
-		INSERT INTO issues (
+		INSERT OR IGNORE INTO issues (
 			id, content_hash, title, description, design, acceptance_criteria, notes,
 			status, priority, issue_type, assignee, estimated_minutes,
 			created_at, updated_at, closed_at, external_ref, source_repo, close_reason,
-			deleted_at, deleted_by, delete_reason, original_type
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			deleted_at, deleted_by, delete_reason, original_type,
+			sender, ephemeral, pinned
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return fmt.Errorf("failed to prepare statement: %w", err)
@@ -57,6 +86,15 @@ func insertIssues(ctx context.Context, conn *sql.Conn, issues []*types.Issue) er
 			sourceRepo = "." // Default to primary repo
 		}
 
+		ephemeral := 0
+		if issue.Ephemeral {
+			ephemeral = 1
+		}
+		pinned := 0
+		if issue.Pinned {
+			pinned = 1
+		}
+
 		_, err = stmt.ExecContext(ctx,
 			issue.ID, issue.ContentHash, issue.Title, issue.Description, issue.Design,
 			issue.AcceptanceCriteria, issue.Notes, issue.Status,
@@ -64,9 +102,15 @@ func insertIssues(ctx context.Context, conn *sql.Conn, issues []*types.Issue) er
 			issue.EstimatedMinutes, issue.CreatedAt, issue.UpdatedAt,
 			issue.ClosedAt, issue.ExternalRef, sourceRepo, issue.CloseReason,
 			issue.DeletedAt, issue.DeletedBy, issue.DeleteReason, issue.OriginalType,
+			issue.Sender, ephemeral, pinned,
 		)
 		if err != nil {
-			return fmt.Errorf("failed to insert issue %s: %w", issue.ID, err)
+			// INSERT OR IGNORE should handle duplicates, but driver may still return error
+			// Explicitly ignore UNIQUE constraint errors (expected for duplicate IDs in JSONL)
+			if !isUniqueConstraintError(err) {
+				return fmt.Errorf("failed to insert issue %s: %w", issue.ID, err)
+			}
+			// Duplicate ID detected and ignored (INSERT OR IGNORE succeeded)
 		}
 	}
 	return nil

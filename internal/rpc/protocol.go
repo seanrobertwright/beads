@@ -72,6 +72,10 @@ type CreateArgs struct {
 	EstimatedMinutes   *int     `json:"estimated_minutes,omitempty"` // Time estimate in minutes
 	Labels             []string `json:"labels,omitempty"`
 	Dependencies       []string `json:"dependencies,omitempty"`
+	// Messaging fields (bd-kwro)
+	Sender    string `json:"sender,omitempty"`     // Who sent this (for messages)
+	Ephemeral bool   `json:"ephemeral,omitempty"`  // Can be bulk-deleted when closed
+	RepliesTo string `json:"replies_to,omitempty"` // Issue ID for conversation threading
 }
 
 // UpdateArgs represents arguments for the update operation
@@ -91,6 +95,16 @@ type UpdateArgs struct {
 	AddLabels          []string `json:"add_labels,omitempty"`
 	RemoveLabels       []string `json:"remove_labels,omitempty"`
 	SetLabels          []string `json:"set_labels,omitempty"`
+	// Messaging fields (bd-kwro)
+	Sender    *string `json:"sender,omitempty"`     // Who sent this (for messages)
+	Ephemeral *bool   `json:"ephemeral,omitempty"`  // Can be bulk-deleted when closed
+	RepliesTo *string `json:"replies_to,omitempty"` // Issue ID for conversation threading
+	// Graph link fields (bd-fu83)
+	RelatesTo    *string `json:"relates_to,omitempty"`    // JSON array of related issue IDs
+	DuplicateOf  *string `json:"duplicate_of,omitempty"`  // Canonical issue ID if duplicate
+	SupersededBy *string `json:"superseded_by,omitempty"` // Replacement issue ID if obsolete
+	// Pinned field (bd-iea)
+	Pinned *bool `json:"pinned,omitempty"` // If true, issue is a persistent context marker
 }
 
 // CloseArgs represents arguments for the close operation
@@ -142,6 +156,9 @@ type ListArgs struct {
 	// Priority range
 	PriorityMin *int `json:"priority_min,omitempty"`
 	PriorityMax *int `json:"priority_max,omitempty"`
+
+	// Pinned filtering (bd-p8e)
+	Pinned *bool `json:"pinned,omitempty"`
 }
 
 // CountArgs represents arguments for the count operation
@@ -197,6 +214,7 @@ type ReadyArgs struct {
 	Assignee   string   `json:"assignee,omitempty"`
 	Unassigned bool     `json:"unassigned,omitempty"`
 	Priority   *int     `json:"priority,omitempty"`
+	Type       string   `json:"type,omitempty"`
 	Limit      int      `json:"limit,omitempty"`
 	SortPolicy string   `json:"sort_policy,omitempty"`
 	Labels     []string `json:"labels,omitempty"`

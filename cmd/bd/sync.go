@@ -10,15 +10,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/config"
-	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/debug"
-	"github.com/steveyegge/beads/internal/deletions"
 	"github.com/steveyegge/beads/internal/git"
 	"github.com/steveyegge/beads/internal/rpc"
 	"github.com/steveyegge/beads/internal/syncbranch"
@@ -60,6 +57,11 @@ Use --merge to merge the sync branch back to main branch.`,
 		squash, _ := cmd.Flags().GetBool("squash")
 		checkIntegrity, _ := cmd.Flags().GetBool("check")
 
+		// If --no-push not explicitly set, check no-push config
+		if !cmd.Flags().Changed("no-push") {
+			noPush = config.GetBool("no-push")
+		}
+
 		// bd-sync-corruption fix: Force direct mode for sync operations.
 		// This prevents stale daemon SQLite connections from corrupting exports.
 		// If the daemon was running but its database file was deleted and recreated
@@ -93,10 +95,7 @@ Use --merge to merge the sync branch back to main branch.`,
 
 		// If check mode, run pre-sync integrity checks (bd-hlsw.1)
 		if checkIntegrity {
-			if err := showSyncIntegrityCheck(ctx, jsonlPath); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
+			showSyncIntegrityCheck(ctx, jsonlPath)
 			return
 		}
 
@@ -609,29 +608,6 @@ Use --merge to merge the sync branch back to main branch.`,
 					}
 				}
 
-				// Step 3.6: Sanitize JSONL - remove any resurrected zombies
-				// Git's 3-way merge may re-add deleted issues to JSONL.
-				// We must remove them before import to prevent resurrection.
-				sanitizeResult, err := sanitizeJSONLWithDeletions(jsonlPath)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Warning: failed to sanitize JSONL: %v\n", err)
-					// Non-fatal - continue with import
-				} else {
-					// bd-3ee1 fix: Log protected issues (local work that would have been incorrectly removed)
-					if sanitizeResult.ProtectedCount > 0 {
-						fmt.Printf("→ Protected %d locally exported issue(s) from incorrect sanitization (bd-3ee1)\n", sanitizeResult.ProtectedCount)
-						for _, id := range sanitizeResult.ProtectedIDs {
-							fmt.Printf("  - %s (in left snapshot)\n", id)
-						}
-					}
-					if sanitizeResult.RemovedCount > 0 {
-						fmt.Printf("→ Sanitized JSONL: removed %d deleted issue(s) that were resurrected by git merge\n", sanitizeResult.RemovedCount)
-						for _, id := range sanitizeResult.RemovedIDs {
-							fmt.Printf("  - %s\n", id)
-						}
-					}
-				}
-
 				// Step 4: Import updated JSONL after pull
 				// Enable --protect-left-snapshot to prevent git-history-backfill from
 				// tombstoning issues that were in our local export but got lost during merge (bd-sync-deletion fix)
@@ -648,12 +624,7 @@ Use --merge to merge the sync branch back to main branch.`,
 						if err != nil {
 							fmt.Fprintf(os.Stderr, "Warning: failed to count issues after import: %v\n", err)
 						} else {
-							// Account for expected deletions from sanitize step (bd-tt0 fix)
-							expectedDeletions := 0
-							if sanitizeResult != nil {
-								expectedDeletions = sanitizeResult.RemovedCount
-							}
-							if err := validatePostImportWithExpectedDeletions(beforeCount, afterCount, expectedDeletions, jsonlPath); err != nil {
+							if err := validatePostImportWithExpectedDeletions(beforeCount, afterCount, 0, jsonlPath); err != nil {
 								fmt.Fprintf(os.Stderr, "Post-import validation failed: %v\n", err)
 								os.Exit(1)
 							}
@@ -765,12 +736,6 @@ Use --merge to merge the sync branch back to main branch.`,
 				fmt.Fprintf(os.Stderr, "Warning: failed to clean up snapshots: %v\n", err)
 			}
 
-			// Auto-compact deletions manifest if enabled and threshold exceeded
-			if err := maybeAutoCompactDeletions(ctx, jsonlPath); err != nil {
-				// Non-fatal - just log warning
-				fmt.Fprintf(os.Stderr, "Warning: auto-compact deletions failed: %v\n", err)
-			}
-
 			// When using sync.branch, restore .beads/ from current branch to keep
 			// working directory clean. The actual beads data lives on the sync branch,
 			// and the main branch's .beads/ should match what's committed there.
@@ -873,7 +838,7 @@ func gitHasChanges(ctx context.Context, filePath string) (bool, error) {
 
 // getRepoRootForWorktree returns the main repository root for running git commands
 // This is always the main repository root, never the worktree root
-func getRepoRootForWorktree(ctx context.Context) string {
+func getRepoRootForWorktree(_ context.Context) string {
 	repoRoot, err := git.GetMainRepoRoot()
 	if err != nil {
 		// Fallback to current directory if GetMainRepoRoot fails
@@ -1317,8 +1282,9 @@ func exportToJSONL(ctx context.Context, jsonlPath string) error {
 		return fmt.Errorf("failed to initialize store: %w", err)
 	}
 
-	// Get all issues
-	issues, err := store.SearchIssues(ctx, "", types.IssueFilter{})
+	// Get all issues including tombstones for sync propagation (bd-rp4o fix)
+	// Tombstones must be exported so they propagate to other clones and prevent resurrection
+	issues, err := store.SearchIssues(ctx, "", types.IssueFilter{IncludeTombstones: true})
 	if err != nil {
 		return fmt.Errorf("failed to get issues: %w", err)
 	}
@@ -1577,15 +1543,27 @@ func mergeSyncBranch(ctx context.Context, dryRun bool) error {
 		return fmt.Errorf("cannot merge while on sync branch '%s' (checkout main branch first)", syncBranch)
 	}
 
-	// Check if main branch is clean
-	statusCmd := exec.CommandContext(ctx, "git", "status", "--porcelain")
+	// Check if main branch is clean (excluding .beads/ which is expected to be dirty)
+	// bd-7b7h fix: The sync.branch workflow copies JSONL to main working dir without committing,
+	// so .beads/ changes are expected and should not block merge.
+	statusCmd := exec.CommandContext(ctx, "git", "status", "--porcelain", "--", ":!.beads/")
 	statusOutput, err := statusCmd.Output()
 	if err != nil {
 		return fmt.Errorf("failed to check git status: %w", err)
 	}
 
 	if len(strings.TrimSpace(string(statusOutput))) > 0 {
-		return fmt.Errorf("main branch has uncommitted changes, please commit or stash them first")
+		return fmt.Errorf("main branch has uncommitted changes outside .beads/, please commit or stash them first")
+	}
+
+	// bd-7b7h fix: Restore .beads/ to HEAD state before merge
+	// The uncommitted .beads/ changes came from copyJSONLToMainRepo during bd sync,
+	// which copied them FROM the sync branch. They're redundant with what we're merging.
+	// Discarding them prevents "Your local changes would be overwritten by merge" errors.
+	restoreCmd := exec.CommandContext(ctx, "git", "checkout", "HEAD", "--", ".beads/")
+	if output, err := restoreCmd.CombinedOutput(); err != nil {
+		// Not fatal - .beads/ might not exist in HEAD yet
+		debug.Logf("note: could not restore .beads/ to HEAD: %v (%s)", err, output)
 	}
 
 	if dryRun {
@@ -1686,234 +1664,6 @@ func importFromJSONL(ctx context.Context, jsonlPath string, renameOnImport bool,
 	}
 
 	return nil
-}
-
-// Default configuration values for auto-compact
-const (
-	defaultAutoCompact          = false
-	defaultAutoCompactThreshold = 1000
-)
-
-// maybeAutoCompactDeletions checks if auto-compact is enabled and threshold exceeded,
-// and if so, prunes the deletions manifest.
-func maybeAutoCompactDeletions(ctx context.Context, jsonlPath string) error {
-	// Ensure store is initialized for config access
-	if err := ensureStoreActive(); err != nil {
-		return nil // Can't access config, skip silently
-	}
-
-	// Check if auto-compact is enabled (disabled by default)
-	autoCompactStr, err := store.GetConfig(ctx, "deletions.auto_compact")
-	if err != nil || autoCompactStr == "" {
-		return nil // Not configured, skip
-	}
-
-	autoCompact := autoCompactStr == "true" || autoCompactStr == "1" || autoCompactStr == "yes"
-	if !autoCompact {
-		return nil // Disabled, skip
-	}
-
-	// Get threshold (default 1000)
-	threshold := defaultAutoCompactThreshold
-	if thresholdStr, err := store.GetConfig(ctx, "deletions.auto_compact_threshold"); err == nil && thresholdStr != "" {
-		if parsed, err := strconv.Atoi(thresholdStr); err == nil && parsed > 0 {
-			threshold = parsed
-		}
-	}
-
-	// Get deletions path
-	beadsDir := filepath.Dir(jsonlPath)
-	deletionsPath := deletions.DefaultPath(beadsDir)
-
-	// Count current deletions
-	count, err := deletions.Count(deletionsPath)
-	if err != nil {
-		return fmt.Errorf("failed to count deletions: %w", err)
-	}
-
-	// Check if threshold exceeded
-	if count <= threshold {
-		return nil // Below threshold, skip
-	}
-
-	// Get retention days (default 7)
-	retentionDays := configfile.DefaultDeletionsRetentionDays
-	if retentionStr, err := store.GetConfig(ctx, "deletions.retention_days"); err == nil && retentionStr != "" {
-		if parsed, err := strconv.Atoi(retentionStr); err == nil && parsed > 0 {
-			retentionDays = parsed
-		}
-	}
-
-	// Prune deletions
-	fmt.Printf("→ Auto-compacting deletions manifest (%d entries > %d threshold)...\n", count, threshold)
-	result, err := deletions.PruneDeletions(deletionsPath, retentionDays)
-	if err != nil {
-		return fmt.Errorf("failed to prune deletions: %w", err)
-	}
-
-	if result.PrunedCount > 0 {
-		fmt.Printf("  Pruned %d entries older than %d days, kept %d entries\n",
-			result.PrunedCount, retentionDays, result.KeptCount)
-	} else {
-		fmt.Printf("  No entries older than %d days to prune\n", retentionDays)
-	}
-
-	return nil
-}
-
-// SanitizeResult contains statistics about the JSONL sanitization operation.
-type SanitizeResult struct {
-	RemovedCount    int      // Number of issues removed from JSONL
-	RemovedIDs      []string // IDs that were removed
-	ProtectedCount  int      // Number of issues protected from removal (bd-3ee1)
-	ProtectedIDs    []string // IDs that were protected
-}
-
-// sanitizeJSONLWithDeletions removes non-tombstone issues from the JSONL file
-// if they are in the deletions manifest. This prevents zombie resurrection when
-// git's 3-way merge re-adds deleted issues to the JSONL during pull.
-//
-// IMPORTANT (bd-kzxd fix): Tombstones are NOT removed. Tombstones are the proper
-// representation of deletions in the JSONL format. Removing them would cause
-// the importer to re-create tombstones from deletions.jsonl, leading to
-// UNIQUE constraint errors when the tombstone already exists in the database.
-//
-// IMPORTANT (bd-3ee1 fix): Issues that were in the left snapshot (local export
-// before pull) are protected from removal. This prevents newly created issues
-// from being incorrectly removed when they happen to have an ID that matches
-// an entry in the deletions manifest (possible with hash-based IDs if content
-// is similar to a previously deleted issue).
-//
-// This should be called after git pull but before import.
-func sanitizeJSONLWithDeletions(jsonlPath string) (*SanitizeResult, error) {
-	result := &SanitizeResult{
-		RemovedIDs:   []string{},
-		ProtectedIDs: []string{},
-	}
-
-	// Get deletions manifest path
-	beadsDir := filepath.Dir(jsonlPath)
-	deletionsPath := deletions.DefaultPath(beadsDir)
-
-	// Load deletions manifest
-	loadResult, err := deletions.LoadDeletions(deletionsPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load deletions manifest: %w", err)
-	}
-
-	// If no deletions, nothing to sanitize
-	if len(loadResult.Records) == 0 {
-		return result, nil
-	}
-
-	// bd-3ee1 fix: Load left snapshot to protect locally exported issues
-	// Issues in the left snapshot were exported before pull and represent
-	// local work that should not be removed by sanitize
-	sm := NewSnapshotManager(jsonlPath)
-	_, leftPath := sm.getSnapshotPaths()
-	protectedIDs := make(map[string]bool)
-	if leftIDs, err := sm.buildIDSet(leftPath); err == nil && len(leftIDs) > 0 {
-		protectedIDs = leftIDs
-	}
-
-	// Read current JSONL
-	f, err := os.Open(jsonlPath) // #nosec G304 - controlled path
-	if err != nil {
-		if os.IsNotExist(err) {
-			return result, nil // No JSONL file yet
-		}
-		return nil, fmt.Errorf("failed to open JSONL: %w", err)
-	}
-
-	var keptLines [][]byte
-
-	scanner := bufio.NewScanner(f)
-	// Allow large lines (up to 10MB for issues with large descriptions)
-	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
-
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(bytes.TrimSpace(line)) == 0 {
-			continue
-		}
-
-		// Extract ID and status to check for tombstones
-		var issue struct {
-			ID     string `json:"id"`
-			Status string `json:"status"`
-		}
-		if err := json.Unmarshal(line, &issue); err != nil {
-			// Keep malformed lines (let import handle them)
-			keptLines = append(keptLines, append([]byte{}, line...))
-			continue
-		}
-
-		// Check if this ID is in deletions manifest
-		if _, deleted := loadResult.Records[issue.ID]; deleted {
-			// bd-kzxd fix: Keep tombstones! They are the proper representation of deletions.
-			// Only remove non-tombstone issues that were resurrected by git merge.
-			if issue.Status == string(types.StatusTombstone) {
-				// Keep the tombstone - it's the authoritative deletion record
-				keptLines = append(keptLines, append([]byte{}, line...))
-			} else if protectedIDs[issue.ID] {
-				// bd-3ee1 fix: Issue was in left snapshot (local export before pull)
-				// This is local work, not a resurrected zombie - protect it!
-				keptLines = append(keptLines, append([]byte{}, line...))
-				result.ProtectedCount++
-				result.ProtectedIDs = append(result.ProtectedIDs, issue.ID)
-			} else {
-				// Remove non-tombstone issue that was resurrected
-				result.RemovedCount++
-				result.RemovedIDs = append(result.RemovedIDs, issue.ID)
-			}
-		} else {
-			keptLines = append(keptLines, append([]byte{}, line...))
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		_ = f.Close()
-		return nil, fmt.Errorf("failed to read JSONL: %w", err)
-	}
-	_ = f.Close()
-
-	// If nothing was removed, we're done
-	if result.RemovedCount == 0 {
-		return result, nil
-	}
-
-	// Write sanitized JSONL atomically
-	dir := filepath.Dir(jsonlPath)
-	base := filepath.Base(jsonlPath)
-	tempFile, err := os.CreateTemp(dir, base+".sanitize.*")
-	if err != nil {
-		return nil, fmt.Errorf("failed to create temp file: %w", err)
-	}
-	tempPath := tempFile.Name()
-	defer func() {
-		_ = tempFile.Close()
-		_ = os.Remove(tempPath) // Clean up on error
-	}()
-
-	for _, line := range keptLines {
-		if _, err := tempFile.Write(line); err != nil {
-			return nil, fmt.Errorf("failed to write line: %w", err)
-		}
-		if _, err := tempFile.Write([]byte("\n")); err != nil {
-			return nil, fmt.Errorf("failed to write newline: %w", err)
-		}
-	}
-
-	if err := tempFile.Close(); err != nil {
-		return nil, fmt.Errorf("failed to close temp file: %w", err)
-	}
-
-	// Atomic replace
-	if err := os.Rename(tempPath, jsonlPath); err != nil {
-		return nil, fmt.Errorf("failed to replace JSONL: %w", err)
-	}
-
-	return result, nil
 }
 
 // resolveNoGitHistoryForFromMain returns the resolved noGitHistory value for sync operations.
@@ -2062,9 +1812,10 @@ type OrphanedChildren struct {
 
 // showSyncIntegrityCheck performs pre-sync integrity checks without modifying state.
 // bd-hlsw.1: Detects forced pushes, prefix mismatches, and orphaned children.
-func showSyncIntegrityCheck(ctx context.Context, jsonlPath string) error {
+// Exits with code 1 if problems are detected.
+func showSyncIntegrityCheck(ctx context.Context, jsonlPath string) {
 	fmt.Println("Sync Integrity Check")
-	fmt.Println("====================\n")
+	fmt.Println("====================")
 
 	result := &SyncIntegrityResult{}
 
@@ -2123,8 +1874,6 @@ func showSyncIntegrityCheck(ctx context.Context, jsonlPath string) error {
 		data, _ := json.MarshalIndent(result, "", "  ")
 		fmt.Println(string(data))
 	}
-
-	return nil
 }
 
 // checkForcedPush detects if the sync branch has diverged from remote.

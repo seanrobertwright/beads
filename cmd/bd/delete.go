@@ -7,14 +7,11 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"strings"
-	"time"
 
 	"github.com/fatih/color"
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/deletions"
 	"github.com/steveyegge/beads/internal/rpc"
 	"github.com/steveyegge/beads/internal/storage/sqlite"
 	"github.com/steveyegge/beads/internal/types"
@@ -94,22 +91,36 @@ var deleteCmd = &cobra.Command{
 This command will:
 1. Remove all dependency links (any type, both directions) involving the issues
 2. Update text references to "[deleted:ID]" in directly connected issues
-3. Delete the issues from the database
+3. Delete the issues from the database (creates tombstones by default)
+
 This is a destructive operation that cannot be undone. Use with caution.
+
 BATCH DELETION:
 Delete multiple issues at once:
   bd delete bd-1 bd-2 bd-3 --force
+
 Delete from file (one ID per line):
   bd delete --from-file deletions.txt --force
+
 Preview before deleting:
   bd delete --from-file deletions.txt --dry-run
+
 DEPENDENCY HANDLING:
 Default: Fails if any issue has dependents not in deletion set
   bd delete bd-1 bd-2
+
 Cascade: Recursively delete all dependents
   bd delete bd-1 --cascade --force
+
 Force: Delete and orphan dependents
-  bd delete bd-1 --force`,
+  bd delete bd-1 --force
+
+PERMANENT DELETION:
+Use --hard to permanently delete (bypass tombstones):
+  bd delete bd-1 bd-2 --hard --force
+
+WARNING: --hard bypasses sync safety. Use only when you are certain
+the issues will not resurrect from remote branches.`,
 	Args: cobra.MinimumNArgs(0),
 	Run: func(cmd *cobra.Command, args []string) {
 		CheckReadonly("delete")
@@ -117,6 +128,7 @@ Force: Delete and orphan dependents
 		force, _ := cmd.Flags().GetBool("force")
 		dryRun, _ := cmd.Flags().GetBool("dry-run")
 		cascade, _ := cmd.Flags().GetBool("cascade")
+		hardDelete, _ := cmd.Flags().GetBool("hard")
 		// Use global jsonOutput set by PersistentPreRun
 		// Collect issue IDs from args and/or file
 		issueIDs := make([]string, 0, len(args))
@@ -153,7 +165,7 @@ Force: Delete and orphan dependents
 		
 		// Handle batch deletion in direct mode
 		if len(issueIDs) > 1 {
-			deleteBatch(cmd, issueIDs, force, dryRun, cascade, jsonOutput, "batch delete")
+			deleteBatch(cmd, issueIDs, force, dryRun, cascade, jsonOutput, hardDelete, "batch delete")
 			return
 		}
 		
@@ -241,13 +253,7 @@ Force: Delete and orphan dependents
 			return
 		}
 		// Actually delete
-		// 0. Record deletion in manifest FIRST (before any DB changes)
-		// This ensures deletion propagates via git sync even if DB operations fail
 		deleteActor := getActorWithGit()
-		if err := recordDeletion(issueID, deleteActor, "manual delete"); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: failed to record deletion: %v\n", err)
-			os.Exit(1)
-		}
 		// 1. Update text references in connected issues (all text fields)
 		updatedIssueCount := 0
 		for id, connIssue := range connectedIssues {
@@ -418,7 +424,7 @@ func removeIssueFromJSONL(issueID string) error {
 }
 // deleteBatch handles deletion of multiple issues
 //nolint:unparam // cmd parameter required for potential future use
-func deleteBatch(_ *cobra.Command, issueIDs []string, force bool, dryRun bool, cascade bool, jsonOutput bool, reason string) {
+func deleteBatch(_ *cobra.Command, issueIDs []string, force bool, dryRun bool, cascade bool, jsonOutput bool, hardDelete bool, reason string) {
 	// Ensure we have a direct store
 	if store == nil {
 		if err := ensureStoreActive(); err != nil {
@@ -508,19 +514,30 @@ func deleteBatch(_ *cobra.Command, issueIDs []string, force bool, dryRun bool, c
 			}
 		}
 	}
-	// Record deletions in manifest FIRST (before any DB changes)
-	// This ensures deletion propagates via git sync even if DB operations fail
-	deleteActor := getActorWithGit()
-	if err := recordDeletions(issueIDs, deleteActor, reason); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: failed to record deletions: %v\n", err)
-		os.Exit(1)
-	}
-	// Actually delete
+	// Actually delete (creates tombstones)
 	result, err := d.DeleteIssues(ctx, issueIDs, cascade, force, false)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
+
+	// Hard delete: immediately prune tombstones from JSONL (bd-4q8)
+	// Note: We keep tombstones in DB to prevent resurrection during sync.
+	// The tombstones will be exported and synced to remote, blocking resurrection.
+	// Use 'bd cleanup --hard' after syncing to fully purge old tombstones.
+	if hardDelete {
+		if !jsonOutput {
+			fmt.Println(color.YellowString("⚠️  HARD DELETE MODE: Pruning tombstones from JSONL"))
+			fmt.Println("  Note: Tombstones kept in DB to prevent resurrection. Run 'bd sync' then 'bd cleanup --hard' to fully purge.")
+		}
+		// Prune tombstones from JSONL using negative TTL (immediate expiration)
+		if pruneResult, err := pruneExpiredTombstones(-1); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to prune tombstones from JSONL: %v\n", err)
+		} else if pruneResult != nil && pruneResult.PrunedCount > 0 && !jsonOutput {
+			fmt.Printf("  Pruned %d tombstone(s) from JSONL\n", pruneResult.PrunedCount)
+		}
+	}
+
 	// Update text references in connected issues (using pre-collected issues)
 	updatedCount := updateTextReferencesInIssues(ctx, issueIDs, connectedIssues)
 	// Note: No longer remove from JSONL - tombstones will be exported to JSONL (bd-3b4)
@@ -674,64 +691,11 @@ func getActorWithGit() string {
 	return "unknown"
 }
 
-// getDeletionsPath returns the path to the deletions manifest file.
-// Uses the same directory as the database.
-func getDeletionsPath() string {
-	// Get the .beads directory from dbPath
-	beadsDir := filepath.Dir(dbPath)
-	return deletions.DefaultPath(beadsDir)
-}
-
-// recordDeletion appends a deletion record to the deletions manifest.
-// This MUST be called BEFORE deleting from the database to ensure
-// deletion records are never lost.
-// After tombstone migration (bd-ffr9), this is a no-op since inline tombstones
-// are used instead of deletions.jsonl.
-func recordDeletion(id, deleteActor, reason string) error {
-	// bd-ffr9: Skip writing to deletions.jsonl if tombstone migration is complete
-	beadsDir := filepath.Dir(dbPath)
-	if deletions.IsTombstoneMigrationComplete(beadsDir) {
-		return nil
-	}
-	record := deletions.DeletionRecord{
-		ID:        id,
-		Timestamp: time.Now().UTC(),
-		Actor:     deleteActor,
-		Reason:    reason,
-	}
-	return deletions.AppendDeletion(getDeletionsPath(), record)
-}
-
-// recordDeletions appends multiple deletion records to the deletions manifest.
-// This MUST be called BEFORE deleting from the database to ensure
-// deletion records are never lost.
-// After tombstone migration (bd-ffr9), this is a no-op since inline tombstones
-// are used instead of deletions.jsonl.
-func recordDeletions(ids []string, deleteActor, reason string) error {
-	// bd-ffr9: Skip writing to deletions.jsonl if tombstone migration is complete
-	beadsDir := filepath.Dir(dbPath)
-	if deletions.IsTombstoneMigrationComplete(beadsDir) {
-		return nil
-	}
-	path := getDeletionsPath()
-	for _, id := range ids {
-		record := deletions.DeletionRecord{
-			ID:        id,
-			Timestamp: time.Now().UTC(),
-			Actor:     deleteActor,
-			Reason:    reason,
-		}
-		if err := deletions.AppendDeletion(path, record); err != nil {
-			return fmt.Errorf("failed to record deletion for %s: %w", id, err)
-		}
-	}
-	return nil
-}
-
 func init() {
 	deleteCmd.Flags().BoolP("force", "f", false, "Actually delete (without this flag, shows preview)")
 	deleteCmd.Flags().String("from-file", "", "Read issue IDs from file (one per line)")
 	deleteCmd.Flags().Bool("dry-run", false, "Preview what would be deleted without making changes")
 	deleteCmd.Flags().Bool("cascade", false, "Recursively delete all dependent issues")
+	deleteCmd.Flags().Bool("hard", false, "Permanently delete (skip tombstone, cannot be recovered via sync)")
 	rootCmd.AddCommand(deleteCmd)
 }
