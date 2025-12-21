@@ -10,6 +10,7 @@ require (
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/fatih/color v1.18.0
 	github.com/fsnotify/fsnotify v1.9.0
+	github.com/google/generative-ai-go v0.18.0
 	github.com/ncruces/go-sqlite3 v0.30.3
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/viper v1.21.0
@@ -17,6 +18,7 @@ require (
 	golang.org/x/mod v0.31.0
 	golang.org/x/sys v0.39.0
 	golang.org/x/term v0.38.0
+	google.golang.org/api v0.217.0
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 	gopkg.in/yaml.v3 v3.0.1
 	rsc.io/script v0.0.2

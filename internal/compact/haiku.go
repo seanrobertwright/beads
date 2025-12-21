@@ -1,4 +1,8 @@
 // Package compact provides AI-powered issue compaction using Claude Haiku.
+//
+// DEPRECATED: This file is kept for backward compatibility.
+// New code should use provider_anthropic.go instead.
+// This file will be removed in a future release.
 package compact
 
 import (
