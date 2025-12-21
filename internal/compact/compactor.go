@@ -15,49 +15,56 @@ const (
 
 // Config holds configuration for the compaction process.
 type Config struct {
-	APIKey      string
-	Concurrency int
-	DryRun      bool
+	Provider     ProviderType
+	APIKey       string
+	Model        string
+	Concurrency  int
+	DryRun       bool
 }
 
 // Compactor handles issue compaction using AI summarization.
 type Compactor struct {
-	store  *sqlite.SQLiteStorage
-	haiku  *HaikuClient
-	config *Config
+	store    *sqlite.SQLiteStorage
+	provider Provider
+	config   *Config
 }
 
 // New creates a new Compactor instance with the given configuration.
-func New(store *sqlite.SQLiteStorage, apiKey string, config *Config) (*Compactor, error) {
+func New(store *sqlite.SQLiteStorage, config *Config) (*Compactor, error) {
 	if config == nil {
 		config = &Config{
+			Provider:    ProviderAnthropic,
 			Concurrency: defaultConcurrency,
 		}
 	}
 	if config.Concurrency <= 0 {
 		config.Concurrency = defaultConcurrency
 	}
-	if apiKey != "" {
-		config.APIKey = apiKey
+	if config.Provider == "" {
+		config.Provider = ProviderAnthropic
 	}
 
-	var haikuClient *HaikuClient
+	var provider Provider
 	var err error
 	if !config.DryRun {
-		haikuClient, err = NewHaikuClient(config.APIKey)
+		providerConfig := ProviderConfig{
+			APIKey: config.APIKey,
+			Model:  config.Model,
+		}
+		provider, err = NewProvider(config.Provider, providerConfig)
 		if err != nil {
 			if errors.Is(err, ErrAPIKeyRequired) {
 				config.DryRun = true
 			} else {
-				return nil, fmt.Errorf("failed to create Haiku client: %w", err)
+				return nil, fmt.Errorf("failed to create provider: %w", err)
 			}
 		}
 	}
 
 	return &Compactor{
-		store:  store,
-		haiku:  haikuClient,
-		config: config,
+		store:    store,
+		provider: provider,
+		config:   config,
 	}, nil
 }
 
@@ -98,9 +105,9 @@ func (c *Compactor) CompactTier1(ctx context.Context, issueID string) error {
 		return fmt.Errorf("dry-run: would compact %s (original size: %d bytes)", issueID, originalSize)
 	}
 
-	summary, err := c.haiku.SummarizeTier1(ctx, issue)
+	summary, err := c.provider.Summarize(ctx, issue)
 	if err != nil {
-		return fmt.Errorf("failed to summarize with Haiku: %w", err)
+		return fmt.Errorf("failed to summarize: %w", err)
 	}
 
 	compactedSize := len(summary)
@@ -243,9 +250,9 @@ func (c *Compactor) compactSingleWithResult(ctx context.Context, issueID string,
 
 	result.OriginalSize = len(issue.Description) + len(issue.Design) + len(issue.Notes) + len(issue.AcceptanceCriteria)
 
-	summary, err := c.haiku.SummarizeTier1(ctx, issue)
+	summary, err := c.provider.Summarize(ctx, issue)
 	if err != nil {
-		return fmt.Errorf("failed to summarize with Haiku: %w", err)
+		return fmt.Errorf("failed to summarize: %w", err)
 	}
 
 	result.CompactedSize = len(summary)
