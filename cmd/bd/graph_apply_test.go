@@ -684,6 +684,8 @@ func TestValidateGraphApplyPlanNodeFieldRules(t *testing.T) {
 		{name: "custom status accepted", customStatuses: []string{"triage"}, mutate: func(n *GraphApplyNode) { n.Status = "triage" }},
 		{name: "custom status rejected without config", mutate: func(n *GraphApplyNode) { n.Status = "triage" }, wantErr: "invalid status"},
 		{name: "negative estimate", mutate: func(n *GraphApplyNode) { n.EstimatedMinutes = &neg }, wantErr: "estimated_minutes"},
+		{name: "priority out of range", mutate: func(n *GraphApplyNode) { p := 9; n.Priority = &p }, wantErr: "invalid priority"},
+		{name: "priority bounds accepted", mutate: func(n *GraphApplyNode) { p := 0; n.Priority = &p }},
 		{name: "invalid wisp_type", mutate: func(n *GraphApplyNode) { n.WispType = "bogus" }, wantErr: "invalid wisp_type"},
 		{name: "valid wisp_type", mutate: func(n *GraphApplyNode) { n.WispType = "heartbeat" }},
 		{name: "invalid mol_type", mutate: func(n *GraphApplyNode) { n.MolType = "bogus" }, wantErr: "invalid mol_type"},
@@ -811,6 +813,66 @@ func TestGraphApplyEdgeDependencyGateMetadata(t *testing.T) {
 			t.Errorf("ThreadID = %q, want thread-9", dep.ThreadID)
 		}
 	})
+}
+
+// TestDetectUnknownGraphFields_CaseInsensitive: encoding/json binds
+// case-variant keys to the matching field, so they must not be reported as
+// silently dropped — only genuinely unknown names are.
+func TestDetectUnknownGraphFields_CaseInsensitive(t *testing.T) {
+	planJSON := []byte(`{
+        "nodes": [{"key": "n", "title": "N", "Pinned": true, "Bogus": 1}]
+    }`)
+	got := detectUnknownGraphFields(planJSON)
+	if !reflect.DeepEqual(got, map[string][]string{`node["n"]`: {"Bogus"}}) {
+		t.Fatalf("case-variant known field misreported: %#v", got)
+	}
+}
+
+func TestValidateGraphApplyStorageClasses(t *testing.T) {
+	on := true
+	plan := &GraphApplyPlan{Nodes: []GraphApplyNode{
+		{Key: "a", Title: "A"},
+		{Key: "b", Title: "B", NoHistory: &on},
+	}}
+
+	t.Run("effective flag+node conflict caught at validation time", func(t *testing.T) {
+		err := validateGraphApplyStorageClasses(plan, GraphApplyOptions{Ephemeral: true}, false)
+		if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+			t.Fatalf("expected effective ephemeral+no_history conflict, got %v", err)
+		}
+	})
+
+	t.Run("mixed storage classes rejected only when uniformity is required", func(t *testing.T) {
+		if err := validateGraphApplyStorageClasses(plan, GraphApplyOptions{}, false); err != nil {
+			t.Fatalf("embedded mode allows mixed plans, got %v", err)
+		}
+		err := validateGraphApplyStorageClasses(plan, GraphApplyOptions{}, true)
+		if err == nil || !strings.Contains(err.Error(), "uniform") {
+			t.Fatalf("expected uniformity error in proxied mode, got %v", err)
+		}
+	})
+}
+
+func TestValidateGraphApplyExplicitIDPrefixes(t *testing.T) {
+	plan := &GraphApplyPlan{Nodes: []GraphApplyNode{
+		{Key: "gen", Title: "Generated"},
+		{Key: "pinnedID", Title: "Pinned", ID: "zz-a1b2c3"},
+	}}
+
+	if err := validateGraphApplyExplicitIDPrefixes(plan, "bd", "", false); err == nil {
+		t.Fatal("expected foreign-prefix explicit id to be rejected")
+	} else if !strings.Contains(err.Error(), `node "pinnedID"`) {
+		t.Fatalf("error should name the node, got %v", err)
+	}
+	if err := validateGraphApplyExplicitIDPrefixes(plan, "zz", "", false); err != nil {
+		t.Fatalf("matching prefix rejected: %v", err)
+	}
+	if err := validateGraphApplyExplicitIDPrefixes(plan, "bd", "zz", false); err != nil {
+		t.Fatalf("allowed_prefixes rejected: %v", err)
+	}
+	if err := validateGraphApplyExplicitIDPrefixes(plan, "bd", "", true); err != nil {
+		t.Fatalf("--force rejected: %v", err)
+	}
 }
 
 // TestGraphApplyNodeCoversCreateIssueParams pins full issue-model parity

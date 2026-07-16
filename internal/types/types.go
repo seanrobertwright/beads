@@ -877,6 +877,24 @@ const (
 	WaitsForAnyChildren = "any-children" // Proceed when first child completes (future)
 )
 
+// IsValidWaitsForGate reports whether gate names a known waits-for fanout gate.
+func IsValidWaitsForGate(gate string) bool {
+	return gate == WaitsForAllChildren || gate == WaitsForAnyChildren
+}
+
+// BuildWaitsForMeta serializes waits-for fanout-gate metadata for
+// Dependency.Metadata, defaulting an empty gate to WaitsForAllChildren.
+func BuildWaitsForMeta(gate, spawnerID string) (string, error) {
+	if gate == "" {
+		gate = WaitsForAllChildren
+	}
+	raw, err := json.Marshal(WaitsForMeta{Gate: gate, SpawnerID: spawnerID})
+	if err != nil {
+		return "", err
+	}
+	return string(raw), nil
+}
+
 // ParseWaitsForGateMetadata extracts the waits-for gate type from dependency metadata.
 // Note: spawner identity comes from dependencies.depends_on_id in storage/query paths;
 // metadata.spawner_id is parsed for compatibility/future explicit targeting.

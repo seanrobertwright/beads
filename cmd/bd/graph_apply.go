@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/steveyegge/beads/internal/config"
@@ -23,8 +24,8 @@ type GraphApplyPlan struct {
 }
 
 // GraphApplyNode describes a single bead to create. Field names follow the
-// types.Issue JSON tags so a node addresses the same model surface as
-// JSONL import and `bd show --json`.
+// types.Issue JSON tags (the names `bd show --json` emits), covering every
+// field single-issue `bd create` can set plus initial status and pinned.
 type GraphApplyNode struct {
 	Key                string                     `json:"key"`
 	ID                 string                     `json:"id,omitempty"` // explicit issue ID (default: generated)
@@ -94,6 +95,7 @@ type GraphApplyResult struct {
 type GraphApplyOptions struct {
 	Ephemeral bool
 	NoHistory bool
+	Force     bool // --force: allow explicit IDs with foreign prefixes
 }
 
 func (opts GraphApplyOptions) Validate() error {
@@ -120,7 +122,7 @@ type GraphApplyDryRunRow struct {
 	ID        string `json:"id,omitempty"` // explicit ID, when the plan sets one
 	Title     string `json:"title"`
 	Type      string `json:"type"`
-	Status    string `json:"status,omitempty"` // explicit initial status, when the plan sets one
+	Status    string `json:"status,omitempty"` // effective initial status (explicit, or deferred when defer_until is future)
 	Priority  int    `json:"priority"`
 	ParentKey string `json:"parent_key,omitempty"`
 	ParentID  string `json:"parent_id,omitempty"`
@@ -270,11 +272,14 @@ func detectUnknownGraphFields(rawData []byte) map[string][]string {
 }
 
 // unknownKeys returns the keys present in have that are not in known, sorted
-// alphabetically for deterministic output.
+// alphabetically for deterministic output. Matching is case-insensitive
+// because encoding/json binds case-variant keys (e.g. "Pinned") to the
+// lowercase field anyway — reporting those as "silently dropped" would be
+// false.
 func unknownKeys(have map[string]json.RawMessage, known map[string]struct{}) []string {
 	var unknown []string
 	for k := range have {
-		if _, ok := known[k]; !ok {
+		if _, ok := known[strings.ToLower(k)]; !ok {
 			unknown = append(unknown, k)
 		}
 	}
@@ -365,6 +370,13 @@ func createIssuesFromGraph(planFile string, dryRun bool, opts GraphApplyOptions)
 	if err := validateGraphApplyPlan(&plan, loadEmbeddedCustomTypes(), loadEmbeddedCustomStatuses()); err != nil {
 		return HandleErrorRespectJSON("invalid graph plan: %v", err)
 	}
+	if err := validateGraphApplyStorageClasses(&plan, opts, false); err != nil {
+		return HandleErrorRespectJSON("invalid graph plan: %v", err)
+	}
+	dbPrefix, allowedPrefixes := loadEmbeddedIDPrefixes()
+	if err := validateGraphApplyExplicitIDPrefixes(&plan, dbPrefix, allowedPrefixes, opts.Force); err != nil {
+		return HandleErrorRespectJSON("invalid graph plan: %v", err)
+	}
 
 	if dryRun {
 		return emitGraphApplyDryRun(&plan)
@@ -406,6 +418,14 @@ func emitGraphApplyDryRun(plan *GraphApplyPlan) error {
 		if effectiveParentKey == "" {
 			effectiveParentKey = node.Parent
 		}
+		// Mirror buildCreateIssue's derivation so the preview matches the
+		// effective status the way it already matches effective type/priority.
+		// (Time-sensitive: a defer_until passing between dry-run and apply
+		// shifts the real status to open.)
+		status := node.Status
+		if status == "" && node.DeferUntil != nil && node.DeferUntil.After(time.Now()) {
+			status = string(types.StatusDeferred)
+		}
 		if effectiveParentKey != "" || node.ParentID != "" {
 			parentDeps++
 		}
@@ -414,7 +434,7 @@ func emitGraphApplyDryRun(plan *GraphApplyPlan) error {
 			ID:        node.ID,
 			Title:     node.Title,
 			Type:      issueType,
-			Status:    node.Status,
+			Status:    status,
 			Priority:  priority,
 			ParentKey: effectiveParentKey,
 			ParentID:  node.ParentID,
@@ -559,7 +579,7 @@ func validateGraphApplyPlan(plan *GraphApplyPlan, customTypes, customStatuses []
 			if graphApplyDependencyType(edge.Type) != types.DepWaitsFor {
 				return fmt.Errorf("edge %d: gate/spawner fields require type %q", i, types.DepWaitsFor)
 			}
-			if edge.Gate != "" && edge.Gate != types.WaitsForAllChildren && edge.Gate != types.WaitsForAnyChildren {
+			if edge.Gate != "" && !types.IsValidWaitsForGate(edge.Gate) {
 				return fmt.Errorf("edge %d: invalid gate %q (valid: %s, %s)", i, edge.Gate, types.WaitsForAllChildren, types.WaitsForAnyChildren)
 			}
 			if edge.SpawnerKey != "" && edge.SpawnerID != "" {
@@ -578,8 +598,9 @@ func validateGraphApplyPlan(plan *GraphApplyPlan, customTypes, customStatuses []
 	return nil
 }
 
-// validateGraphApplyNodeFields checks the single-node fields added for full
-// issue-model parity, mirroring the checks `bd create` applies to its flags.
+// validateGraphApplyNodeFields checks the single-node fields added for
+// bd-create parity, mirroring the flag-shape checks `bd create` applies
+// (config-gated template linting is not run on graph plans).
 func validateGraphApplyNodeFields(node GraphApplyNode, customStatuses []string) error {
 	if node.ID != "" {
 		if _, err := validation.ValidateIDFormat(node.ID); err != nil {
@@ -587,7 +608,10 @@ func validateGraphApplyNodeFields(node GraphApplyNode, customStatuses []string) 
 		}
 	}
 	if node.Status != "" && !types.Status(node.Status).IsValidWithCustom(customStatuses) {
-		return fmt.Errorf("node %q: invalid status %q (built-in: open, in_progress, blocked, deferred, closed, pinned, hooked; or configure custom statuses via 'bd config set status.custom')", node.Key, node.Status)
+		return fmt.Errorf("node %q: invalid status %q (valid: %s; configure custom statuses via 'bd config set status.custom')", node.Key, node.Status, validStatusList(customStatuses))
+	}
+	if node.Priority != nil && (*node.Priority < 0 || *node.Priority > 4) {
+		return fmt.Errorf("node %q: invalid priority %d (must be between 0 and 4)", node.Key, *node.Priority)
 	}
 	if node.EstimatedMinutes != nil && *node.EstimatedMinutes < 0 {
 		return fmt.Errorf("node %q: estimated_minutes must be non-negative", node.Key)
@@ -605,6 +629,58 @@ func validateGraphApplyNodeFields(node GraphApplyNode, customStatuses []string) 
 		return fmt.Errorf("node %q: event_kind, actor, target, and payload require type %q", node.Key, types.TypeEvent)
 	}
 	return nil
+}
+
+// validateGraphApplyStorageClasses resolves each node's effective storage
+// class (per-node overrides combined with the plan-wide CLI flags) so that
+// conflicts surface at validation/dry-run time instead of mid-apply. When
+// requireUniform is set (proxied-server mode, where domain graph creation
+// routes the whole plan to a single table), mixed durable/wisp plans are
+// rejected as well.
+func validateGraphApplyStorageClasses(plan *GraphApplyPlan, opts GraphApplyOptions, requireUniform bool) error {
+	var useWisp bool
+	for i, node := range plan.Nodes {
+		ephemeral, noHistory, err := graphApplyNodeStorageClass(node, opts)
+		if err != nil {
+			return err
+		}
+		nodeWisp := ephemeral || noHistory
+		if i == 0 {
+			useWisp = nodeWisp
+		} else if requireUniform && nodeWisp != useWisp {
+			return fmt.Errorf("node %q: per-node ephemeral/no_history overrides must be uniform across the plan in proxied-server mode", node.Key)
+		}
+	}
+	return nil
+}
+
+// validateGraphApplyExplicitIDPrefixes mirrors the `bd create --id` prefix
+// check for every plan node that pins an explicit ID: the ID must start with
+// the database prefix (or one of allowed_prefixes) unless force is set.
+func validateGraphApplyExplicitIDPrefixes(plan *GraphApplyPlan, dbPrefix, allowedPrefixes string, force bool) error {
+	for _, node := range plan.Nodes {
+		if node.ID == "" {
+			continue
+		}
+		if err := validation.ValidateIDPrefixAllowed(node.ID, dbPrefix, allowedPrefixes, force); err != nil {
+			return fmt.Errorf("node %q: %w", node.Key, err)
+		}
+	}
+	return nil
+}
+
+// loadEmbeddedIDPrefixes returns the database prefix and allowed_prefixes for
+// explicit-ID validation. YAML config takes precedence over DB — in
+// shared-server mode the DB may belong to a different project (GH#2469).
+func loadEmbeddedIDPrefixes() (dbPrefix, allowedPrefixes string) {
+	dbPrefix = config.GetString("issue-prefix")
+	if store != nil {
+		if dbPrefix == "" {
+			dbPrefix, _ = store.GetConfig(rootCtx, "issue_prefix") // Best effort: empty prefix is a valid fallback
+		}
+		allowedPrefixes, _ = store.GetConfig(rootCtx, "allowed_prefixes") // Best effort: empty means no prefix restriction
+	}
+	return dbPrefix, allowedPrefixes
 }
 
 func validateGraphApplyLocalCycles(plan *GraphApplyPlan, knownKeys map[string]bool) error {
@@ -719,6 +795,18 @@ func graphApplyNodeIssue(node GraphApplyNode, opts GraphApplyOptions, createdBy,
 	if node.Status != "" {
 		issue.Status = types.Status(node.Status)
 	}
+	// Backfill status-coupled timestamps here rather than relying on storage:
+	// the embedded path gets closed_at from issueops.PrepareIssueForInsert,
+	// but the proxied domain insert performs no backfill, and neither path
+	// stamps started_at for issues born in_progress (ManageStartedAt only
+	// fires on later status updates).
+	now := time.Now().UTC()
+	if issue.Status == types.StatusClosed && issue.ClosedAt == nil {
+		issue.ClosedAt = &now
+	}
+	if issue.Status == types.StatusInProgress && issue.StartedAt == nil {
+		issue.StartedAt = &now
+	}
 	issue.Pinned = node.Pinned
 	return issue, nil
 }
@@ -750,19 +838,15 @@ func graphApplyEdgeDependency(edge GraphApplyEdge, fromID, toID string, depType 
 		Type:        depType,
 	}
 	if edge.Gate != "" || edge.SpawnerKey != "" || edge.SpawnerID != "" {
-		gate := edge.Gate
-		if gate == "" {
-			gate = types.WaitsForAllChildren
-		}
 		spawnerID := edge.SpawnerID
 		if edge.SpawnerKey != "" {
 			spawnerID = resolveKey(edge.SpawnerKey)
 		}
-		metaBytes, err := json.Marshal(types.WaitsForMeta{Gate: gate, SpawnerID: spawnerID})
+		meta, err := types.BuildWaitsForMeta(edge.Gate, spawnerID)
 		if err != nil {
 			return nil, fmt.Errorf("edge %s->%s: serializing waits-for metadata: %w", fromID, toID, err)
 		}
-		dep.Metadata = string(metaBytes)
+		dep.Metadata = meta
 	}
 	dep.ThreadID = edge.ThreadID
 	return dep, nil

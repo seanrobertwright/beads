@@ -523,8 +523,9 @@ bd create [title] [flags]
 
 `bd create --graph plan.json` creates a whole issue graph atomically from a
 JSON plan. Node field names follow the issue model's JSON tags (the same
-names `bd show --json` emits), so every native field except comments is
-addressable from a plan:
+names `bd show --json` emits), and every field single-issue `bd create` can
+set is addressable from a plan — plus an initial `status` and `pinned`,
+which `bd create` has no flags for:
 
 ```json
 {
@@ -593,8 +594,9 @@ Edge notes:
   `spawner_id` an existing issue.
 - `thread_id` threads conversation edges (e.g. `replies-to`).
 
-Comments are the one model surface a plan cannot create; use `bd comments add`
-after creation.
+Comments cannot be created from a plan; use `bd comments add` after creation.
+Model fields without `bd create` flags (`sender`, `work_type`, `is_template`,
+`await_*`, `bonded_from`, `source_*`) are likewise not settable from plans.
 
 ### bd create-form
 

@@ -75,9 +75,11 @@ var createCmd = &cobra.Command{
 			graphDryRun, _ := cmd.Flags().GetBool("dry-run")
 			wisp, _ := cmd.Flags().GetBool("ephemeral")
 			noHistory, _ := cmd.Flags().GetBool("no-history")
+			graphForce, _ := cmd.Flags().GetBool("force")
 			graphOpts := GraphApplyOptions{
 				Ephemeral: wisp,
 				NoHistory: noHistory,
+				Force:     graphForce,
 			}
 			if err := graphOpts.Validate(); err != nil {
 				return HandleError("invalid graph options: %v", err)

@@ -25,6 +25,16 @@ func resolveProxiedCustomTypes(dbTypes []string) []string {
 	return config.GetCustomTypesFromYAML()
 }
 
+// resolveProxiedCustomStatuses mirrors loadEmbeddedCustomStatuses for
+// proxied-server mode: the server database is authoritative (that's where
+// 'bd config set status.custom' writes), with local YAML as fallback.
+func resolveProxiedCustomStatuses(ctx context.Context, uw uow.UnitOfWork) []string {
+	if cs, err := uw.ConfigUseCase().GetCustomStatuses(ctx); err == nil && len(cs) > 0 {
+		return types.CustomStatusNames(cs)
+	}
+	return config.GetCustomStatusesFromYAML()
+}
+
 func runCreateProxiedServer(cmd *cobra.Command, ctx context.Context, in createInput) error {
 	if in.repoOverrideSet {
 		return HandleError("--repo is not supported with --proxied-server")
@@ -388,11 +398,13 @@ func runCreateProxiedGraph(_ *cobra.Command, ctx context.Context, in createInput
 			return HandleError("open unit of work: %v", err)
 		}
 		cctx, err := dryUW.ConfigUseCase().LoadCreateContext(ctx)
-		dryUW.Close(ctx)
 		if err != nil {
+			dryUW.Close(ctx)
 			return HandleError("load create context: %v", err)
 		}
-		if err := validateGraphApplyPlan(&plan, resolveProxiedCustomTypes(cctx.CustomTypes), config.GetCustomStatusesFromYAML()); err != nil {
+		customStatuses := resolveProxiedCustomStatuses(ctx, dryUW)
+		dryUW.Close(ctx)
+		if err := validateProxiedGraphPlan(&plan, in, cctx, customStatuses); err != nil {
 			return HandleError("invalid graph plan: %v", err)
 		}
 		if err := emitGraphApplyDryRun(&plan); err != nil {
@@ -417,7 +429,7 @@ func runCreateProxiedGraph(_ *cobra.Command, ctx context.Context, in createInput
 			return nil, "", fmt.Errorf("load create context: %w", err)
 		}
 
-		if err := validateGraphApplyPlan(&plan, resolveProxiedCustomTypes(cctx.CustomTypes), config.GetCustomStatusesFromYAML()); err != nil {
+		if err := validateProxiedGraphPlan(&plan, in, cctx, resolveProxiedCustomStatuses(ctx, uw)); err != nil {
 			return nil, "", fmt.Errorf("invalid graph plan: %w", err)
 		}
 
@@ -456,6 +468,21 @@ func runCreateProxiedGraph(_ *cobra.Command, ctx context.Context, in createInput
 		fmt.Printf("  %s -> %s\n", k, res[k])
 	}
 	return nil
+}
+
+// validateProxiedGraphPlan runs the full plan validation for proxied-server
+// mode: the shared plan checks, effective storage classes (uniform, since
+// domain graph creation routes the whole plan to one table), and explicit-ID
+// prefix checks against the server's prefix config, mirroring single create.
+func validateProxiedGraphPlan(plan *GraphApplyPlan, in createInput, cctx domain.CreateContext, customStatuses []string) error {
+	if err := validateGraphApplyPlan(plan, resolveProxiedCustomTypes(cctx.CustomTypes), customStatuses); err != nil {
+		return err
+	}
+	opts := GraphApplyOptions{Ephemeral: in.ephemeral, NoHistory: in.noHistory}
+	if err := validateGraphApplyStorageClasses(plan, opts, true); err != nil {
+		return err
+	}
+	return validateGraphApplyExplicitIDPrefixes(plan, overlayYAMLPrefix(cctx.IssuePrefix), cctx.AllowedPrefixes, in.force)
 }
 
 // buildDomainGraphPlan materializes every plan node through the shared

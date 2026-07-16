@@ -939,10 +939,6 @@ func (u *issueUseCaseImpl) applyGraph(ctx context.Context, plan GraphPlan, actor
 				ThreadID:    edge.ThreadID,
 			}
 			if edge.Gate != "" || edge.SpawnerKey != "" || edge.SpawnerID != "" {
-				gate := edge.Gate
-				if gate == "" {
-					gate = types.WaitsForAllChildren
-				}
 				spawnerID := edge.SpawnerID
 				if edge.SpawnerKey != "" {
 					resolved, ok := keyToID[edge.SpawnerKey]
@@ -951,11 +947,11 @@ func (u *issueUseCaseImpl) applyGraph(ctx context.Context, plan GraphPlan, actor
 					}
 					spawnerID = resolved
 				}
-				metaBytes, err := json.Marshal(types.WaitsForMeta{Gate: gate, SpawnerID: spawnerID})
+				meta, err := types.BuildWaitsForMeta(edge.Gate, spawnerID)
 				if err != nil {
 					return GraphApplyResult{}, fmt.Errorf("applyGraph: edge %d: serializing waits-for metadata: %w", i, err)
 				}
-				dep.Metadata = string(metaBytes)
+				dep.Metadata = meta
 			}
 			if err := u.depRepo.Insert(ctx, dep, actor, DepInsertOpts{UseWispsTable: useWisp}); err != nil {
 				return GraphApplyResult{}, fmt.Errorf("applyGraph: edge %d (%s -> %s): %w", i, fromID, toID, err)
@@ -1038,14 +1034,16 @@ func readyPathDepType(t types.DependencyType) bool {
 	return t.AffectsReadyWork()
 }
 
-// resolveEdgeRef returns the ID for an edge endpoint: the keyToID lookup
-// when key is set, else the explicit id. Returns "" when neither resolves,
-// which the caller should treat as a structural error.
+// resolveEdgeRef returns the ID for an edge endpoint: the explicit id when
+// set (an ID override wins over a plan-local key, matching the CLI embedded
+// path and TestValidateGraphApplyPlanIgnoresIDOverridesForLocalCycleValidation),
+// else the keyToID lookup. Returns "" when neither resolves, which the
+// caller should treat as a structural error.
 func resolveEdgeRef(key, id string, keyToID map[string]string) string {
-	if key != "" {
-		return keyToID[key]
+	if id != "" {
+		return id
 	}
-	return id
+	return keyToID[key]
 }
 
 // validatePlannedBlockingPaths rejects plans that would close a cycle
