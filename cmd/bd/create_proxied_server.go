@@ -407,8 +407,8 @@ func runCreateProxiedGraph(_ *cobra.Command, ctx context.Context, in createInput
 		if err := validateProxiedGraphPlan(&plan, in, cctx, customStatuses); err != nil {
 			return HandleError("invalid graph plan: %v", err)
 		}
-		if err := emitGraphApplyDryRun(&plan); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		if err := emitGraphApplyDryRun(&plan, GraphApplyOptions{Ephemeral: in.ephemeral, NoHistory: in.noHistory}); err != nil {
+			return HandleError("%v", err)
 		}
 		return nil
 	}
@@ -499,11 +499,10 @@ func buildDomainGraphPlan(plan GraphApplyPlan, in createInput) (domain.GraphPlan
 		if err != nil {
 			return domain.GraphPlan{}, false, fmt.Errorf("invalid graph plan: %w", err)
 		}
-		nodeWisp := issue.Ephemeral || issue.NoHistory
 		if i == 0 {
-			useWisp = nodeWisp
-		} else if nodeWisp != useWisp {
-			return domain.GraphPlan{}, false, fmt.Errorf("node %q: per-node ephemeral/no_history overrides must be uniform across the plan in proxied-server mode", n.Key)
+			// validateGraphApplyStorageClasses(requireUniform=true) already
+			// rejected mixed plans, so the first node decides the table.
+			useWisp = issue.Ephemeral || issue.NoHistory
 		}
 		nodes = append(nodes, domain.GraphNode{
 			Key:               n.Key,

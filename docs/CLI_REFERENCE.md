@@ -550,14 +550,16 @@ which `bd create` has no flags for:
       "id": "bd-a1b2c3",
       "ephemeral": false, "no_history": false,
       "wisp_type": "heartbeat", "mol_type": "swarm",
-      "pinned": false,
-      "event_kind": "agent.started", "actor": "agent://a", "target": "bead://b", "payload": "{}"
+      "pinned": false
     },
-    { "key": "impl", "title": "Implement it", "parent_key": "api" }
+    { "key": "impl", "title": "Implement it", "parent_key": "api" },
+    { "key": "gate", "title": "Fanout gate" },
+    { "key": "launch", "title": "Launch announced", "type": "event",
+      "event_kind": "agent.started", "actor": "agent://a", "target": "bead://b", "payload": "{}" }
   ],
   "edges": [
-    { "from_key": "impl", "to_key": "api", "type": "blocks" },
-    { "from_key": "api", "to_key": "impl", "type": "waits-for",
+    { "from_key": "gate", "to_key": "api", "type": "blocks" },
+    { "from_key": "gate", "to_key": "impl", "type": "waits-for",
       "gate": "any-children", "spawner_key": "impl" }
   ]
 }
@@ -590,8 +592,13 @@ Edge notes:
   create `parent-child` edges; don't repeat them in `edges`.
 - `gate` (`all-children` | `any-children`) and `spawner_key`/`spawner_id`
   attach fanout-gate metadata to `waits-for` edges, mirroring
-  `--waits-for`/`--waits-for-gate`. `spawner_key` references a plan node;
-  `spawner_id` an existing issue.
+  `--waits-for`/`--waits-for-gate`. The `to` endpoint of a `waits-for` edge
+  *is* the spawner (gate evaluation watches its children), so `spawner_key`
+  must match `to_key` and `spawner_id` must match `to_id`; they exist to make
+  plans self-documenting.
+- Edges with ready-work-affecting types (`blocks`, `waits-for`, …) may not
+  duplicate or reverse a `parent_key`/`parent_id` relationship, and a parent
+  may not be connected to its own child through them.
 - `thread_id` threads conversation edges (e.g. `replies-to`).
 
 Comments cannot be created from a plan; use `bd comments add` after creation.

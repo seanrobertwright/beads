@@ -895,6 +895,21 @@ func BuildWaitsForMeta(gate, spawnerID string) (string, error) {
 	return string(raw), nil
 }
 
+// BuildWaitsForEdgeMeta serializes gate metadata for a waits-for dependency
+// edge, resolving a plan-local spawner key through keyToID when set. The
+// spawner is recorded for compatibility only — gate evaluation reads the
+// spawner from dependencies.depends_on_id (see ParseWaitsForGateMetadata).
+func BuildWaitsForEdgeMeta(gate, spawnerKey, spawnerID string, keyToID map[string]string) (string, error) {
+	if spawnerKey != "" {
+		resolved, ok := keyToID[spawnerKey]
+		if !ok {
+			return "", fmt.Errorf("unresolved spawner key %q", spawnerKey)
+		}
+		spawnerID = resolved
+	}
+	return BuildWaitsForMeta(gate, spawnerID)
+}
+
 // ParseWaitsForGateMetadata extracts the waits-for gate type from dependency metadata.
 // Note: spawner identity comes from dependencies.depends_on_id in storage/query paths;
 // metadata.spawner_id is parsed for compatibility/future explicit targeting.

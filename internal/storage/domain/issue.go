@@ -935,16 +935,8 @@ func (u *issueUseCaseImpl) applyGraph(ctx context.Context, plan GraphPlan, actor
 				Type:        depType,
 				ThreadID:    edge.ThreadID,
 			}
-			if edge.Gate != "" || edge.SpawnerKey != "" || edge.SpawnerID != "" {
-				spawnerID := edge.SpawnerID
-				if edge.SpawnerKey != "" {
-					resolved, ok := keyToID[edge.SpawnerKey]
-					if !ok {
-						return GraphApplyResult{}, fmt.Errorf("applyGraph: edge %d references undefined spawner_key %q", i, edge.SpawnerKey)
-					}
-					spawnerID = resolved
-				}
-				meta, err := types.BuildWaitsForMeta(edge.Gate, spawnerID)
+			if depType == types.DepWaitsFor {
+				meta, err := types.BuildWaitsForEdgeMeta(edge.Gate, edge.SpawnerKey, edge.SpawnerID, keyToID)
 				if err != nil {
 					return GraphApplyResult{}, fmt.Errorf("applyGraph: edge %d: serializing waits-for metadata: %w", i, err)
 				}

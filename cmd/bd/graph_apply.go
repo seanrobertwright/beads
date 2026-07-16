@@ -373,13 +373,15 @@ func createIssuesFromGraph(planFile string, dryRun bool, opts GraphApplyOptions)
 	if err := validateGraphApplyStorageClasses(&plan, opts, false); err != nil {
 		return HandleErrorRespectJSON("invalid graph plan: %v", err)
 	}
-	dbPrefix, allowedPrefixes := loadEmbeddedIDPrefixes()
-	if err := validateGraphApplyExplicitIDPrefixes(&plan, dbPrefix, allowedPrefixes, opts.Force); err != nil {
-		return HandleErrorRespectJSON("invalid graph plan: %v", err)
+	if graphPlanHasExplicitIDs(&plan) {
+		dbPrefix, allowedPrefixes := loadEmbeddedIDPrefixes()
+		if err := validateGraphApplyExplicitIDPrefixes(&plan, dbPrefix, allowedPrefixes, opts.Force); err != nil {
+			return HandleErrorRespectJSON("invalid graph plan: %v", err)
+		}
 	}
 
 	if dryRun {
-		return emitGraphApplyDryRun(&plan)
+		return emitGraphApplyDryRun(&plan, opts)
 	}
 
 	result, err := executeGraphApply(rootCtx, &plan, opts)
@@ -402,29 +404,28 @@ func createIssuesFromGraph(planFile string, dryRun bool, opts GraphApplyOptions)
 	return nil
 }
 
-func emitGraphApplyDryRun(plan *GraphApplyPlan) error {
+// emitGraphApplyDryRun prints what `bd create --graph` would do without
+// performing any writes. Mirrors the JSON-vs-human split of the live path.
+// (GH#3367)
+func emitGraphApplyDryRun(plan *GraphApplyPlan, opts GraphApplyOptions) error {
 	parentDeps := 0
 	rows := make([]GraphApplyDryRunRow, 0, len(plan.Nodes))
 	for _, node := range plan.Nodes {
-		issueType := node.Type
-		if issueType == "" {
-			issueType = string(types.TypeTask)
-		}
-		priority := 2
-		if node.Priority != nil {
-			priority = *node.Priority
+		// Derive the preview through the same materialization the apply path
+		// uses so type/priority/status defaults can't drift. (Time-sensitive:
+		// a defer_until passing between dry-run and apply still shifts the
+		// real status to open.)
+		issue, err := graphApplyNodeIssue(node, opts, "", "")
+		if err != nil {
+			return HandleErrorRespectJSON("invalid graph plan: %v", err)
 		}
 		effectiveParentKey := node.ParentKey
 		if effectiveParentKey == "" {
 			effectiveParentKey = node.Parent
 		}
-		// Mirror buildCreateIssue's derivation so the preview matches the
-		// effective status the way it already matches effective type/priority.
-		// (Time-sensitive: a defer_until passing between dry-run and apply
-		// shifts the real status to open.)
-		status := node.Status
-		if status == "" && node.DeferUntil != nil && node.DeferUntil.After(time.Now()) {
-			status = string(types.StatusDeferred)
+		status := string(issue.Status)
+		if node.Status == "" && issue.Status == types.StatusOpen {
+			status = "" // default status: keep the preview row terse
 		}
 		if effectiveParentKey != "" || node.ParentID != "" {
 			parentDeps++
@@ -433,9 +434,9 @@ func emitGraphApplyDryRun(plan *GraphApplyPlan) error {
 			Key:       node.Key,
 			ID:        node.ID,
 			Title:     node.Title,
-			Type:      issueType,
+			Type:      string(issue.IssueType),
 			Status:    status,
-			Priority:  priority,
+			Priority:  issue.Priority,
 			ParentKey: effectiveParentKey,
 			ParentID:  node.ParentID,
 		})
@@ -495,8 +496,11 @@ func validateGraphApplyPlan(plan *GraphApplyPlan, customTypes, customStatuses []
 			return fmt.Errorf("node %q has empty title", node.Key)
 		}
 		if node.Type != "" {
+			// Accept aliases (feat, adr, ms, ...) the same way single-issue
+			// bd create does: it normalizes before storing, so a type is
+			// valid if either its raw or normalized form is known.
 			it := types.IssueType(node.Type)
-			if !it.IsValidWithCustom(customTypes) {
+			if !it.IsValidWithCustom(customTypes) && !it.Normalize().IsValidWithCustom(customTypes) {
 				return fmt.Errorf("node %q: invalid type %q", node.Key, node.Type)
 			}
 		}
@@ -588,6 +592,15 @@ func validateGraphApplyPlan(plan *GraphApplyPlan, customTypes, customStatuses []
 			if edge.SpawnerKey != "" && !seenKeys[edge.SpawnerKey] {
 				return fmt.Errorf("edge %d: spawner key %q not found in plan", i, edge.SpawnerKey)
 			}
+			// Gate evaluation resolves the spawner from the dependency target
+			// (depends_on_id), never from metadata, so a spawner that differs
+			// from the to endpoint would be silently ignored at runtime.
+			if edge.SpawnerKey != "" && edge.SpawnerKey != edge.ToKey {
+				return fmt.Errorf("edge %d: spawner_key %q must match to_key %q (the waits-for target is the spawner)", i, edge.SpawnerKey, edge.ToKey)
+			}
+			if edge.SpawnerID != "" && edge.SpawnerID != edge.ToID {
+				return fmt.Errorf("edge %d: spawner_id %q must match to_id %q (the waits-for target is the spawner)", i, edge.SpawnerID, edge.ToID)
+			}
 		}
 	}
 
@@ -622,8 +635,10 @@ func validateGraphApplyNodeFields(node GraphApplyNode, customStatuses []string) 
 	if node.MolType != "" && !types.MolType(node.MolType).IsValid() {
 		return fmt.Errorf("node %q: invalid mol_type %q (must be swarm, patrol, or work)", node.Key, node.MolType)
 	}
-	if node.Ephemeral != nil && node.NoHistory != nil && *node.Ephemeral && *node.NoHistory {
-		return fmt.Errorf("node %q: ephemeral and no_history are mutually exclusive", node.Key)
+	// Node-level ephemeral+no_history conflicts: graphApplyNodeStorageClass
+	// owns the rule; zero opts resolves to the node's own fields.
+	if _, _, err := graphApplyNodeStorageClass(node, GraphApplyOptions{}); err != nil {
+		return err
 	}
 	if (node.EventKind != "" || node.Actor != "" || node.Target != "" || node.Payload != "") && node.Type != string(types.TypeEvent) {
 		return fmt.Errorf("node %q: event_kind, actor, target, and payload require type %q", node.Key, types.TypeEvent)
@@ -648,7 +663,7 @@ func validateGraphApplyStorageClasses(plan *GraphApplyPlan, opts GraphApplyOptio
 		if i == 0 {
 			useWisp = nodeWisp
 		} else if requireUniform && nodeWisp != useWisp {
-			return fmt.Errorf("node %q: per-node ephemeral/no_history overrides must be uniform across the plan in proxied-server mode", node.Key)
+			return fmt.Errorf("plan mixes durable and wisp storage classes (node %q vs node %q): effective ephemeral/no_history must be uniform across the plan in proxied-server mode", plan.Nodes[0].Key, node.Key)
 		}
 	}
 	return nil
@@ -669,11 +684,23 @@ func validateGraphApplyExplicitIDPrefixes(plan *GraphApplyPlan, dbPrefix, allowe
 	return nil
 }
 
+// graphPlanHasExplicitIDs reports whether any plan node pins an explicit
+// issue ID, so callers can skip loading prefix config for the common case.
+func graphPlanHasExplicitIDs(plan *GraphApplyPlan) bool {
+	for _, node := range plan.Nodes {
+		if node.ID != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // loadEmbeddedIDPrefixes returns the database prefix and allowed_prefixes for
-// explicit-ID validation. YAML config takes precedence over DB — in
-// shared-server mode the DB may belong to a different project (GH#2469).
+// explicit-ID validation. YAML config takes precedence over DB (via
+// overlayYAMLPrefix) — in shared-server mode the DB may belong to a different
+// project (GH#2469).
 func loadEmbeddedIDPrefixes() (dbPrefix, allowedPrefixes string) {
-	dbPrefix = config.GetString("issue-prefix")
+	dbPrefix = overlayYAMLPrefix("")
 	if store != nil {
 		if dbPrefix == "" {
 			dbPrefix, _ = store.GetConfig(rootCtx, "issue_prefix") // Best effort: empty prefix is a valid fallback
@@ -830,19 +857,17 @@ func graphApplyNodeStorageClass(node GraphApplyNode, opts GraphApplyOptions) (ep
 
 // graphApplyEdgeDependency builds the dependency record for an edge, including
 // waits-for gate metadata (types.WaitsForMeta) and conversation thread IDs.
-// resolveKey maps a plan-local node key to its minted issue ID.
-func graphApplyEdgeDependency(edge GraphApplyEdge, fromID, toID string, depType types.DependencyType, resolveKey func(string) string) (*types.Dependency, error) {
+// keyToID maps plan-local node keys to their minted issue IDs. Every waits-for
+// edge gets gate metadata — the SQL gate evaluation treats a missing gate as
+// NULL, not as the all-children default, so '{}' metadata must never be stored.
+func graphApplyEdgeDependency(edge GraphApplyEdge, fromID, toID string, depType types.DependencyType, keyToID map[string]string) (*types.Dependency, error) {
 	dep := &types.Dependency{
 		IssueID:     fromID,
 		DependsOnID: toID,
 		Type:        depType,
 	}
-	if edge.Gate != "" || edge.SpawnerKey != "" || edge.SpawnerID != "" {
-		spawnerID := edge.SpawnerID
-		if edge.SpawnerKey != "" {
-			spawnerID = resolveKey(edge.SpawnerKey)
-		}
-		meta, err := types.BuildWaitsForMeta(edge.Gate, spawnerID)
+	if depType == types.DepWaitsFor {
+		meta, err := types.BuildWaitsForEdgeMeta(edge.Gate, edge.SpawnerKey, edge.SpawnerID, keyToID)
 		if err != nil {
 			return nil, fmt.Errorf("edge %s->%s: serializing waits-for metadata: %w", fromID, toID, err)
 		}
@@ -990,7 +1015,7 @@ func executeGraphApply(ctx context.Context, plan *GraphApplyPlan, opts GraphAppl
 				if parentDepPairs[graphApplyDepPairKey(toID, fromID)] && graphApplyCycleRelevantDependencyType(depType) {
 					return fmt.Errorf("edge %d %s->%s creates a blocking reverse of a parent-child relationship", i, fromID, toID)
 				}
-				dep, err := graphApplyEdgeDependency(edge, fromID, toID, depType, func(key string) string { return keyToID[key] })
+				dep, err := graphApplyEdgeDependency(edge, fromID, toID, depType, keyToID)
 				if err != nil {
 					return err
 				}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
@@ -11,6 +12,48 @@ import (
 
 	"github.com/steveyegge/beads/internal/types"
 )
+
+// TestDocsGraphPlanExampleValidates pins the CLI_REFERENCE.md --graph example
+// to the validator: the canonical example must stay a plan `bd create --graph`
+// actually accepts (review caught it shipping with event fields on a task
+// node and edges duplicating parent_key).
+func TestDocsGraphPlanExampleValidates(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "docs", "CLI_REFERENCE.md"))
+	if err != nil {
+		t.Fatalf("read CLI_REFERENCE.md: %v", err)
+	}
+	marker := "Graph plan schema (`--graph`)"
+	idx := strings.Index(string(data), marker)
+	if idx < 0 {
+		t.Fatal("graph plan schema section not found in CLI_REFERENCE.md")
+	}
+	rest := string(data)[idx:]
+	const fence = "```json\n"
+	start := strings.Index(rest, fence)
+	if start < 0 {
+		t.Fatal("example JSON block not found after graph plan schema heading")
+	}
+	rest = rest[start+len(fence):]
+	end := strings.Index(rest, "```")
+	if end < 0 {
+		t.Fatal("example JSON block not terminated")
+	}
+	planJSON := []byte(rest[:end])
+
+	if unknown := detectUnknownGraphFields(planJSON); len(unknown) > 0 {
+		t.Errorf("documented example uses unknown fields: %v", unknown)
+	}
+	var plan GraphApplyPlan
+	if err := json.Unmarshal(planJSON, &plan); err != nil {
+		t.Fatalf("documented example is not valid plan JSON: %v", err)
+	}
+	if err := validateGraphApplyPlan(&plan, nil, nil); err != nil {
+		t.Errorf("documented example rejected by validator: %v", err)
+	}
+	if err := validateGraphApplyStorageClasses(&plan, GraphApplyOptions{}, false); err != nil {
+		t.Errorf("documented example rejected by storage-class validation: %v", err)
+	}
+}
 
 func TestValidateGraphApplyPlanAcceptsCustomTypes(t *testing.T) {
 	plan := &GraphApplyPlan{
@@ -184,7 +227,7 @@ func TestEmitGraphApplyDryRun_ParentAlias(t *testing.T) {
 		},
 	}
 	out := captureStdout(t, func() error {
-		emitGraphApplyDryRun(plan)
+		emitGraphApplyDryRun(plan, GraphApplyOptions{})
 		return nil
 	})
 	if !strings.Contains(out, "1 parent-child link(s)") {
@@ -365,7 +408,7 @@ func TestEmitGraphApplyDryRun_Counts(t *testing.T) {
 	}
 
 	out := captureStdout(t, func() error {
-		emitGraphApplyDryRun(plan)
+		emitGraphApplyDryRun(plan, GraphApplyOptions{})
 		return nil
 	})
 
@@ -565,7 +608,7 @@ func TestEmitGraphApplyDryRun_JSON(t *testing.T) {
 	defer func() { jsonOutput = oldJSON }()
 
 	out := captureStdout(t, func() error {
-		emitGraphApplyDryRun(plan)
+		emitGraphApplyDryRun(plan, GraphApplyOptions{})
 		return nil
 	})
 
@@ -680,6 +723,7 @@ func TestValidateGraphApplyPlanNodeFieldRules(t *testing.T) {
 		wantErr        string
 	}{
 		{name: "invalid status", mutate: func(n *GraphApplyNode) { n.Status = "bogus" }, wantErr: "invalid status"},
+		{name: "alias type accepted like bd create", mutate: func(n *GraphApplyNode) { n.Type = "feat" }},
 		{name: "builtin status accepted", mutate: func(n *GraphApplyNode) { n.Status = "in_progress" }},
 		{name: "custom status accepted", customStatuses: []string{"triage"}, mutate: func(n *GraphApplyNode) { n.Status = "triage" }},
 		{name: "custom status rejected without config", mutate: func(n *GraphApplyNode) { n.Status = "triage" }, wantErr: "invalid status"},
@@ -746,6 +790,9 @@ func TestValidateGraphApplyPlanEdgeGateRules(t *testing.T) {
 		{name: "invalid gate value", edge: GraphApplyEdge{FromKey: "gate", ToKey: "spawner", Type: "waits-for", Gate: "bogus"}, wantErr: "invalid gate"},
 		{name: "spawner_key and spawner_id conflict", edge: GraphApplyEdge{FromKey: "gate", ToKey: "spawner", Type: "waits-for", SpawnerKey: "spawner", SpawnerID: "bd-x"}, wantErr: "cannot specify both"},
 		{name: "unknown spawner_key", edge: GraphApplyEdge{FromKey: "gate", ToKey: "spawner", Type: "waits-for", SpawnerKey: "ghost"}, wantErr: "spawner key"},
+		{name: "spawner_key must match to_key", edge: GraphApplyEdge{FromKey: "gate", ToKey: "spawner", Type: "waits-for", SpawnerKey: "gate"}, wantErr: "must match to_key"},
+		{name: "spawner_id must match to_id", edge: GraphApplyEdge{FromKey: "gate", ToID: "bd-ext1", Type: "waits-for", SpawnerID: "bd-other"}, wantErr: "must match to_id"},
+		{name: "matching spawner_id accepted", edge: GraphApplyEdge{FromKey: "gate", ToID: "bd-ext1", Type: "waits-for", SpawnerID: "bd-ext1"}},
 		{name: "valid gated waits-for edge", edge: GraphApplyEdge{FromKey: "gate", ToKey: "spawner", Type: "waits-for", Gate: "any-children", SpawnerKey: "spawner"}},
 	}
 	for _, tc := range cases {
@@ -766,9 +813,7 @@ func TestValidateGraphApplyPlanEdgeGateRules(t *testing.T) {
 }
 
 func TestGraphApplyEdgeDependencyGateMetadata(t *testing.T) {
-	resolve := func(key string) string {
-		return map[string]string{"spawner": "bd-spawn1"}[key]
-	}
+	resolve := map[string]string{"spawner": "bd-spawn1"}
 
 	t.Run("gate and spawner_key resolve into waits-for metadata", func(t *testing.T) {
 		edge := GraphApplyEdge{Type: "waits-for", Gate: "any-children", SpawnerKey: "spawner"}
@@ -811,6 +856,31 @@ func TestGraphApplyEdgeDependencyGateMetadata(t *testing.T) {
 		}
 		if dep.ThreadID != "thread-9" {
 			t.Errorf("ThreadID = %q, want thread-9", dep.ThreadID)
+		}
+	})
+
+	t.Run("ungated waits-for edge still gets all-children metadata", func(t *testing.T) {
+		// '{}' metadata must never be stored for waits-for deps: the gate SQL
+		// reads $.gate and NULL poisons its NOT(... AND ...) predicate,
+		// unblocking the gate as soon as the first child closes.
+		edge := GraphApplyEdge{Type: "waits-for"}
+		dep, err := graphApplyEdgeDependency(edge, "bd-from", "bd-to", "waits-for", resolve)
+		if err != nil {
+			t.Fatalf("graphApplyEdgeDependency: %v", err)
+		}
+		var meta types.WaitsForMeta
+		if err := json.Unmarshal([]byte(dep.Metadata), &meta); err != nil {
+			t.Fatalf("metadata not valid WaitsForMeta JSON (%q): %v", dep.Metadata, err)
+		}
+		if meta.Gate != types.WaitsForAllChildren {
+			t.Errorf("gate = %q, want all-children default for ungated waits-for edge", meta.Gate)
+		}
+	})
+
+	t.Run("unresolved spawner_key errors instead of writing empty spawner", func(t *testing.T) {
+		edge := GraphApplyEdge{Type: "waits-for", SpawnerKey: "ghost"}
+		if _, err := graphApplyEdgeDependency(edge, "bd-from", "bd-to", "waits-for", resolve); err == nil {
+			t.Fatal("expected error for unresolved spawner key")
 		}
 	})
 }
