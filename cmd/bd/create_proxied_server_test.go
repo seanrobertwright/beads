@@ -327,6 +327,49 @@ func TestBuildDomainGraphPlan(t *testing.T) {
 	}
 }
 
+// TestBuildDomainGraphPlan_AliasesAndDeps pins the proxied path's handling of
+// the parent/estimate aliases and per-node deps — all three were silently
+// dropped before reaching the domain apply (review finding).
+func TestBuildDomainGraphPlan_AliasesAndDeps(t *testing.T) {
+	est := 90
+	canonical := 30
+	plan := GraphApplyPlan{
+		Nodes: []GraphApplyNode{
+			{Key: "root", Title: "Root"},
+			{Key: "child", Title: "Child", Parent: "root", Estimate: &est,
+				Deps: []GraphApplyNodeDep{{Target: "root"}, {Target: "ext-1", Type: "related"}}},
+			{Key: "both", Title: "Both", EstimatedMinutes: &canonical, Estimate: &est},
+		},
+	}
+
+	got, err := buildDomainGraphPlan(plan, createInput{createdBy: "t"})
+	if err != nil {
+		t.Fatalf("buildDomainGraphPlan: %v", err)
+	}
+
+	c := got.Nodes[1]
+	if c.ParentKey != "root" {
+		t.Errorf("parent alias not folded into ParentKey: %q", c.ParentKey)
+	}
+	if c.Issue.EstimatedMinutes == nil || *c.Issue.EstimatedMinutes != 90 {
+		t.Errorf("estimate alias lost: %v", c.Issue.EstimatedMinutes)
+	}
+	if len(c.Deps) != 2 {
+		t.Fatalf("deps len = %d, want 2", len(c.Deps))
+	}
+	if c.Deps[0].Target != "root" || c.Deps[0].Type != types.DepBlocks {
+		t.Errorf("dep 0 = %+v, want target root type blocks", c.Deps[0])
+	}
+	if c.Deps[1].Target != "ext-1" || c.Deps[1].Type != types.DependencyType("related") {
+		t.Errorf("dep 1 = %+v", c.Deps[1])
+	}
+
+	b := got.Nodes[2]
+	if b.Issue.EstimatedMinutes == nil || *b.Issue.EstimatedMinutes != 30 {
+		t.Errorf("estimated_minutes should win over the alias: %v", b.Issue.EstimatedMinutes)
+	}
+}
+
 func TestParseMarkdownDepSpecs(t *testing.T) {
 	tests := []struct {
 		name    string

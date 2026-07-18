@@ -180,6 +180,14 @@ type GraphNode struct {
 	AssignAfterCreate bool
 	MetadataRefs      map[string]string
 	Labels            []string
+	Deps              []GraphNodeDep
+}
+
+// GraphNodeDep is an inline dependency on a single graph node. Target is
+// resolved as a plan-local key first, then treated as a literal issue ID.
+type GraphNodeDep struct {
+	Type   types.DependencyType
+	Target string
 }
 
 type GraphEdge struct {
@@ -920,6 +928,37 @@ func (u *issueUseCaseImpl) applyGraph(ctx context.Context, plan GraphPlan, actor
 			}
 			if isSchedulingDep(depType) {
 				newSchedulingEdges = append(newSchedulingEdges, [2]string{fromID, toID})
+			}
+		}
+
+		// Per-node inline deps in stable order for this phase, mirroring the
+		// embedded executeGraphApply (cmd/bd/graph_apply.go).
+		for _, node := range plan.Nodes {
+			for _, nd := range node.Deps {
+				depType := nd.Type
+				if depType == "" {
+					depType = types.DepBlocks
+				}
+				if (depType == types.DepParentChild) != parentPhase {
+					continue
+				}
+				targetID := keyToID[nd.Target]
+				if targetID == "" {
+					targetID = nd.Target
+				}
+				if targetID == "" {
+					return GraphApplyResult{}, fmt.Errorf("applyGraph: node %q: dep target %q not found", node.Key, nd.Target)
+				}
+				dep, err := types.NewGraphEdgeDependency(keyToID[node.Key], targetID, depType, "", "", "", "", nil)
+				if err != nil {
+					return GraphApplyResult{}, fmt.Errorf("applyGraph: node %q: dep to %q: %w", node.Key, nd.Target, err)
+				}
+				if err := u.depRepo.Insert(ctx, dep, actor, DepInsertOpts{UseWispsTable: useWisp}); err != nil {
+					return GraphApplyResult{}, fmt.Errorf("applyGraph: node %q: adding dep to %q: %w", node.Key, nd.Target, err)
+				}
+				if isSchedulingDep(depType) {
+					newSchedulingEdges = append(newSchedulingEdges, [2]string{dep.IssueID, dep.DependsOnID})
+				}
 			}
 		}
 	}

@@ -933,9 +933,11 @@ func BuildWaitsForEdgeMeta(gate, spawnerKey, spawnerID string, keyToID map[strin
 
 // NewGraphEdgeDependency builds the dependency record for a graph plan edge,
 // shared by the embedded and domain apply paths so they cannot drift. Every
-// waits-for edge gets gate metadata — the SQL gate evaluation treats a
-// missing gate as NULL, not as the all-children default, so '{}' or empty
-// metadata must never be stored for waits-for dependencies.
+// waits-for edge gets gate metadata: stored rows stay self-describing rather
+// than depending on every reader defaulting a missing gate (the runtime SQL
+// predicate COALESCEs to all-children, but readers before migration 0056 did
+// not, so '{}' or empty metadata must never be stored for graph-created
+// waits-for dependencies).
 func NewGraphEdgeDependency(fromID, toID string, depType DependencyType, gate, spawnerKey, spawnerID, threadID string, keyToID map[string]string) (*Dependency, error) {
 	dep := &Dependency{
 		IssueID:     fromID,

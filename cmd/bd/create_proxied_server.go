@@ -501,15 +501,23 @@ func buildDomainGraphPlan(plan GraphApplyPlan, in createInput) (domain.GraphPlan
 		if err != nil {
 			return domain.GraphPlan{}, fmt.Errorf("invalid graph plan: %w", err)
 		}
+		deps := make([]domain.GraphNodeDep, 0, len(n.Deps))
+		for _, d := range n.Deps {
+			deps = append(deps, domain.GraphNodeDep{
+				Type:   graphApplyDependencyType(d.Type),
+				Target: d.Target,
+			})
+		}
 		nodes = append(nodes, domain.GraphNode{
 			Key:               n.Key,
 			Issue:             issue,
-			ParentKey:         n.ParentKey,
+			ParentKey:         n.effectiveParentKey(),
 			ParentID:          n.ParentID,
 			Assignee:          n.Assignee,
 			AssignAfterCreate: n.AssignAfterCreate,
 			MetadataRefs:      n.MetadataRefs,
 			Labels:            n.Labels,
+			Deps:              deps,
 		})
 	}
 	edges := make([]domain.GraphEdge, 0, len(plan.Edges))

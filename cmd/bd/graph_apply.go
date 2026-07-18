@@ -65,6 +65,17 @@ type GraphApplyNode struct {
 	Payload            string                     `json:"payload,omitempty"`    // type=event only
 }
 
+// effectiveParentKey resolves the parent alias: parent_key wins, then parent.
+// Every consumer of a node's plan-local parent (validation, dry-run, embedded
+// apply, proxied apply) must go through this so the alias can't be dropped on
+// one path.
+func (n GraphApplyNode) effectiveParentKey() string {
+	if n.ParentKey != "" {
+		return n.ParentKey
+	}
+	return n.Parent
+}
+
 // GraphApplyEdge describes a dependency edge.
 type GraphApplyEdge struct {
 	FromKey string `json:"from_key,omitempty"`
@@ -383,10 +394,7 @@ func emitGraphApplyDryRun(plan *GraphApplyPlan, opts GraphApplyOptions) error {
 		if err != nil {
 			return HandleErrorRespectJSON("invalid graph plan: %v", err)
 		}
-		effectiveParentKey := node.ParentKey
-		if effectiveParentKey == "" {
-			effectiveParentKey = node.Parent
-		}
+		effectiveParentKey := node.effectiveParentKey()
 		status := string(issue.Status)
 		if node.Status == "" && issue.Status == types.StatusOpen {
 			status = "" // default status: keep the preview row terse
@@ -491,10 +499,7 @@ func validateGraphApplyPlan(plan *GraphApplyPlan, customTypes, customStatuses []
 				}
 			}
 		}
-		parentKey := node.ParentKey
-		if parentKey == "" {
-			parentKey = node.Parent
-		}
+		parentKey := node.effectiveParentKey()
 		if parentKey != "" && !seenKeys[parentKey] {
 			found := false
 			for _, other := range plan.Nodes {
@@ -506,9 +511,6 @@ func validateGraphApplyPlan(plan *GraphApplyPlan, customTypes, customStatuses []
 			if !found {
 				return fmt.Errorf("node %q: parent key %q not found in plan", node.Key, parentKey)
 			}
-		}
-		if node.Estimate != nil && *node.Estimate < 0 {
-			return fmt.Errorf("node %q: estimate cannot be negative", node.Key)
 		}
 		for j, dep := range node.Deps {
 			if dep.Target == "" {
@@ -693,10 +695,11 @@ func loadEmbeddedIDPrefixes() (dbPrefix, allowedPrefixes string) {
 func validateGraphApplyLocalCycles(plan *GraphApplyPlan, knownKeys map[string]bool) error {
 	adj := make(map[string][]string)
 	for _, node := range plan.Nodes {
-		if node.ParentKey != "" && knownKeys[node.Key] && knownKeys[node.ParentKey] {
-			// ParentKey is guaranteed local by validateGraphApplyPlan, so it is
-			// safe to model the implicit parent-child dependency by key here.
-			adj[node.Key] = append(adj[node.Key], node.ParentKey)
+		parentKey := node.effectiveParentKey()
+		if parentKey != "" && knownKeys[node.Key] && knownKeys[parentKey] {
+			// The parent key is guaranteed local by validateGraphApplyPlan, so it
+			// is safe to model the implicit parent-child dependency by key here.
+			adj[node.Key] = append(adj[node.Key], parentKey)
 		}
 	}
 	for _, edge := range plan.Edges {
@@ -772,6 +775,14 @@ func graphApplyNodeIssue(node GraphApplyNode, opts GraphApplyOptions, createdBy,
 		owner = node.Owner
 	}
 
+	// Resolve the estimate alias here so every materialization path (embedded,
+	// proxied, dry-run, validation) sees one canonical field. The canonical
+	// estimated_minutes wins when both are set, matching the parent alias.
+	estimatedMinutes := node.EstimatedMinutes
+	if estimatedMinutes == nil {
+		estimatedMinutes = node.Estimate
+	}
+
 	issue := buildCreateIssue(createIssueParams{
 		ID:                 node.ID,
 		Title:              node.Title,
@@ -783,7 +794,7 @@ func graphApplyNodeIssue(node GraphApplyNode, opts GraphApplyOptions, createdBy,
 		Priority:           priority,
 		IssueType:          issueType.Normalize(),
 		ExternalRef:        node.ExternalRef,
-		EstimatedMinutes:   node.EstimatedMinutes,
+		EstimatedMinutes:   estimatedMinutes,
 		Ephemeral:          ephemeral,
 		NoHistory:          noHistory,
 		CreatedBy:          createdBy,
@@ -865,9 +876,6 @@ func executeGraphApply(ctx context.Context, plan *GraphApplyPlan, opts GraphAppl
 			if err != nil {
 				return err
 			}
-			if node.Estimate != nil {
-				issue.EstimatedMinutes = node.Estimate
-			}
 			if node.Assignee != "" {
 				if node.AssignAfterCreate {
 					pendingAssignees[i] = node.Assignee
@@ -928,10 +936,7 @@ func executeGraphApply(ctx context.Context, plan *GraphApplyPlan, opts GraphAppl
 		// dependency sources below are also processed parent-first, so every
 		// blocking edge sees the plan's full hierarchy in storage.
 		for i, node := range plan.Nodes {
-			parentKey := node.ParentKey
-			if parentKey == "" {
-				parentKey = node.Parent
-			}
+			parentKey := node.effectiveParentKey()
 			parentID := node.ParentID
 			if parentKey != "" {
 				parentID = keyToID[parentKey]
@@ -997,10 +1002,11 @@ func executeGraphApply(ctx context.Context, plan *GraphApplyPlan, opts GraphAppl
 					if targetID == "" {
 						return fmt.Errorf("node %q: dep target %q not found", node.Key, dep.Target)
 					}
-					d := &types.Dependency{
-						IssueID:     issues[i].ID,
-						DependsOnID: targetID,
-						Type:        depType,
+					// Shared builder so waits-for deps carry gate metadata like
+					// waits-for edges (all-children default, no explicit spawner).
+					d, err := types.NewGraphEdgeDependency(issues[i].ID, targetID, depType, "", "", "", "", nil)
+					if err != nil {
+						return fmt.Errorf("node %q: dep to %q: %w", node.Key, dep.Target, err)
 					}
 					if err := tx.AddDependency(ctx, d, actor); err != nil {
 						return fmt.Errorf("node %q: adding dep to %q: %w", node.Key, dep.Target, err)
@@ -1117,8 +1123,8 @@ func validateGraphApplyPlannedParentBlockingPaths(ctx context.Context, tx storag
 	for _, node := range plan.Nodes {
 		childID := keyToID[node.Key]
 		parentID := node.ParentID
-		if node.ParentKey != "" {
-			parentID = keyToID[node.ParentKey]
+		if parentKey := node.effectiveParentKey(); parentKey != "" {
+			parentID = keyToID[parentKey]
 		}
 		if childID == "" || parentID == "" {
 			continue
@@ -1221,8 +1227,8 @@ func graphApplyParentDepPairs(nodes []GraphApplyNode, keyToID map[string]string)
 	pairs := make(map[string]bool)
 	for _, node := range nodes {
 		parentID := node.ParentID
-		if node.ParentKey != "" {
-			parentID = keyToID[node.ParentKey]
+		if parentKey := node.effectiveParentKey(); parentKey != "" {
+			parentID = keyToID[parentKey]
 		}
 		childID := keyToID[node.Key]
 		if childID != "" && parentID != "" {
