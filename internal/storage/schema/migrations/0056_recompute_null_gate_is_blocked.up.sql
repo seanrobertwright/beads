@@ -18,14 +18,20 @@
 -- there. Run the full issue+wisp recompute when the wisp tables exist and a
 -- wisp-free variant (issues/dependencies only) when they don't; ignored/0013
 -- repairs the wisp rows once the clone-local tables materialize.
+-- The full variant queries both wisps and wisp_dependencies, so require both
+-- to exist before selecting it — a half-materialized wisp bootstrap must not
+-- wedge the migration pass on a missing table.
 SET @has_wisps = (
     SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
-    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'wisps'
+    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('wisps', 'wisp_dependencies')
 );
 
-UPDATE issues SET is_blocked = 0;
+-- Self-assign updated_at: is_blocked is derived state and issues.updated_at
+-- carries ON UPDATE CURRENT_TIMESTAMP; letting the recompute bump it plants
+-- per-clone wall clock in a synced table (see blocked_state.go, bd-578h9.19).
+UPDATE issues SET is_blocked = 0, updated_at = updated_at;
 
-SET @sql = IF(@has_wisps > 0,
+SET @sql = IF(@has_wisps > 1,
 'WITH RECURSIVE
   directly_blocked(kind, id) AS (
     SELECT DISTINCT ''issue'', i.id
@@ -212,7 +218,7 @@ SET @sql = IF(@has_wisps > 0,
     WHERE child.status NOT IN (''closed'', ''pinned'')
   )
 UPDATE issues
-SET is_blocked = 1
+SET is_blocked = 1, updated_at = updated_at
 WHERE id IN (SELECT id FROM reachable WHERE kind = ''issue'')
   AND status NOT IN (''closed'', ''pinned'')',
 'WITH RECURSIVE
@@ -274,7 +280,7 @@ WHERE id IN (SELECT id FROM reachable WHERE kind = ''issue'')
     WHERE child.status NOT IN (''closed'', ''pinned'')
   )
 UPDATE issues
-SET is_blocked = 1
+SET is_blocked = 1, updated_at = updated_at
 WHERE id IN (SELECT id FROM reachable)
   AND status NOT IN (''closed'', ''pinned'')');
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;

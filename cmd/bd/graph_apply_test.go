@@ -143,9 +143,9 @@ func TestValidateGraphApplyPlanAcceptsNewFields(t *testing.T) {
 }
 
 // TestValidateGraphApplyPlanRejectsNegativeEstimate verifies that a negative
-// estimate (via the alias) is caught at validation time: the alias folds into
-// estimated_minutes in graphApplyNodeIssue, so the issue-model validator
-// rejects it. (GH#4064)
+// estimate (via the alias) is caught at validation time — even when
+// estimated_minutes is also set and would win the alias fold, so the bad
+// value can't be silently discarded by the precedence. (GH#4064)
 func TestValidateGraphApplyPlanRejectsNegativeEstimate(t *testing.T) {
 	neg := -5
 	plan := &GraphApplyPlan{
@@ -157,7 +157,17 @@ func TestValidateGraphApplyPlanRejectsNegativeEstimate(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for negative estimate")
 	}
-	if !strings.Contains(err.Error(), "estimated_minutes cannot be negative") {
+	if !strings.Contains(err.Error(), "estimate cannot be negative") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	canonical := 10
+	plan.Nodes[0].EstimatedMinutes = &canonical
+	err = validateGraphApplyPlan(plan, nil, nil)
+	if err == nil {
+		t.Fatal("expected error for negative estimate alongside estimated_minutes")
+	}
+	if !strings.Contains(err.Error(), "estimate cannot be negative") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }

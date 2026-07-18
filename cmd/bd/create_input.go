@@ -282,7 +282,7 @@ var singleIssueOnlyFlags = []string{
 	"labels", "label", "skills", "context",
 	"event-category", "event-actor", "event-target", "event-payload",
 	"due", "defer",
-	"metadata", "estimate", "force", "wisp-type",
+	"metadata", "estimate", "wisp-type",
 }
 
 func rejectSingleIssueFlagsForMarkdown(cmd *cobra.Command) error {
@@ -290,6 +290,12 @@ func rejectSingleIssueFlagsForMarkdown(cmd *cobra.Command) error {
 		if cmd.Flags().Changed(name) {
 			return HandleError("--%s is not valid with --file (markdown templates supply per-issue fields)", name)
 		}
+	}
+	// --force is plan-wide for --graph (foreign-prefix explicit IDs) but the
+	// markdown path never consults it, so reject it here rather than accept
+	// and silently ignore.
+	if cmd.Flags().Changed("force") {
+		return HandleError("--force is not valid with --file (markdown templates supply per-issue fields)")
 	}
 	return nil
 }

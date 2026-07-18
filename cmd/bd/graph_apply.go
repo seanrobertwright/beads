@@ -310,13 +310,18 @@ func loadEmbeddedCustomTypes() []string {
 	return config.GetCustomTypesFromYAML()
 }
 
+// loadEmbeddedCustomStatuses reads custom statuses from the store only — no
+// YAML fallback, matching single-issue create and loadListFilterConfig
+// (custom types fall back to YAML; custom statuses deliberately do not).
 func loadEmbeddedCustomStatuses() []string {
-	if store != nil {
-		if cs, err := store.GetCustomStatuses(rootCtx); err == nil && len(cs) > 0 {
-			return cs
-		}
+	if store == nil {
+		return nil
 	}
-	return config.GetCustomStatusesFromYAML()
+	cs, err := store.GetCustomStatuses(rootCtx)
+	if err != nil {
+		return nil
+	}
+	return cs
 }
 
 // createIssuesFromGraph handles `bd create --graph <plan-file>`.
@@ -773,7 +778,12 @@ func graphApplyNodeIssue(node GraphApplyNode, opts GraphApplyOptions, createdBy,
 
 	// Resolve the estimate alias here so every materialization path (embedded,
 	// proxied, dry-run, validation) sees one canonical field. The canonical
-	// estimated_minutes wins when both are set, matching the parent alias.
+	// estimated_minutes wins when both are set, matching the parent alias —
+	// but a negative alias value is still rejected rather than silently
+	// discarded by the precedence (GH#4064).
+	if node.Estimate != nil && *node.Estimate < 0 {
+		return nil, fmt.Errorf("node %q: estimate cannot be negative", node.Key)
+	}
 	estimatedMinutes := node.EstimatedMinutes
 	if estimatedMinutes == nil {
 		estimatedMinutes = node.Estimate
@@ -971,12 +981,16 @@ func executeGraphApply(ctx context.Context, plan *GraphApplyPlan, opts GraphAppl
 			// Add per-node inline dependencies in stable order for this phase.
 			for i, node := range plan.Nodes {
 				for _, dep := range node.Deps {
-					d, err := types.NewGraphNodeDependency(issues[i].ID, types.DependencyType(dep.Type), dep.Target, keyToID)
+					depType := types.DependencyType(dep.Type)
+					if depType == "" {
+						depType = types.DepBlocks
+					}
+					if (depType == types.DepParentChild) != parentPhase {
+						continue
+					}
+					d, err := types.NewGraphNodeDependency(issues[i].ID, depType, dep.Target, keyToID)
 					if err != nil {
 						return fmt.Errorf("node %q: %w", node.Key, err)
-					}
-					if (d.Type == types.DepParentChild) != parentPhase {
-						continue
 					}
 					if err := tx.AddDependency(ctx, d, actor); err != nil {
 						return fmt.Errorf("node %q: adding dep to %q: %w", node.Key, dep.Target, err)

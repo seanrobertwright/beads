@@ -27,13 +27,11 @@ func resolveProxiedCustomTypes(dbTypes []string) []string {
 
 // resolveProxiedCustomStatuses mirrors loadEmbeddedCustomStatuses for
 // proxied-server mode: the server database is authoritative (that's where
-// 'bd config set status.custom' writes; it rides along in CreateContext),
-// with local YAML as fallback.
+// 'bd config set status.custom' writes; it rides along in CreateContext).
+// No YAML fallback — statuses are store-only everywhere (single-issue
+// create, list filters), unlike custom types.
 func resolveProxiedCustomStatuses(cs []types.CustomStatus) []string {
-	if len(cs) > 0 {
-		return types.CustomStatusNames(cs)
-	}
-	return config.GetCustomStatusesFromYAML()
+	return types.CustomStatusNames(cs)
 }
 
 func runCreateProxiedServer(cmd *cobra.Command, ctx context.Context, in createInput) error {
