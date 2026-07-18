@@ -572,6 +572,8 @@ Node notes:
   database prefix, like `bd create --id`).
 - `parent_key` (a plan node key) or `parent_id` (an existing issue ID) adds a
   `parent-child` dependency on the created node.
+- `parent` and `estimate` are accepted aliases for `parent_key` and
+  `estimated_minutes`; the canonical field wins when both spellings are set.
 - `status` sets the initial status (default `open`, or `deferred` when
   `defer_until` is in the future). Nodes created `closed` get `closed_at`
   auto-filled. Timestamps are RFC3339; relative forms like `+6h` are not
