@@ -985,7 +985,7 @@ func IsValidWaitsForGate(gate string) bool {
 // waits-for edge gets gate metadata (empty gate defaults to all-children):
 // stored rows stay self-describing rather than depending on every reader
 // defaulting a missing gate (the runtime SQL predicate COALESCEs to
-// all-children, but readers before migration 0056 did not, so '{}' or empty
+// all-children, but readers before migration 0059 did not, so '{}' or empty
 // metadata must never be stored for graph-created waits-for dependencies).
 // A plan-local spawnerKey resolves through keyToID; the spawner is recorded
 // for compatibility only — gate evaluation reads the spawner from

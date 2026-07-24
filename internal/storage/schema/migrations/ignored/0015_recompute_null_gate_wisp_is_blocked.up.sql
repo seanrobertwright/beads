@@ -1,12 +1,16 @@
 -- Recompute wisps.is_blocked with a NULL-safe waits-for gate predicate.
 --
--- Twin of main migration 0056_recompute_null_gate_is_blocked.up.sql for the
+-- Twin of main migration 0059_recompute_null_gate_is_blocked.up.sql for the
 -- clone-local wisps table: ignored/0007 evaluated
 -- JSON_EXTRACT(d.metadata, '$.gate') = 'any-children' directly, so waits-for
 -- dependencies without gate metadata yielded NULL and poisoned the enclosing
 -- NOT(... AND ...), computing the waiter unblocked as soon as any child
 -- closed. COALESCE to the all-children default and re-run the recompute.
-UPDATE wisps SET is_blocked = 0;
+-- Self-assign updated_at: is_blocked is derived state and wisps.updated_at
+-- carries ON UPDATE CURRENT_TIMESTAMP; letting the recompute bump it makes a
+-- derived-state repair look like a user edit to staleness/TTL consumers
+-- (matching the 0059 twin and blocked_state.go, bd-578h9.19).
+UPDATE wisps SET is_blocked = 0, updated_at = updated_at;
 
 WITH RECURSIVE
   directly_blocked(kind, id) AS (
@@ -194,6 +198,6 @@ WITH RECURSIVE
     WHERE child.status NOT IN ('closed', 'pinned')
   )
 UPDATE wisps
-SET is_blocked = 1
+SET is_blocked = 1, updated_at = updated_at
 WHERE id IN (SELECT id FROM reachable WHERE kind = 'wisp')
   AND status NOT IN ('closed', 'pinned');

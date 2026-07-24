@@ -8,7 +8,7 @@
 -- as any child closed. COALESCE to the all-children default (matching
 -- internal/storage/issueops/blocked_state.go) and re-run the recompute so
 -- rows mis-set by 0047 are repaired. The wisps-side twin is
--- ignored/0013_recompute_null_gate_wisp_is_blocked.up.sql.
+-- ignored/0015_recompute_null_gate_wisp_is_blocked.up.sql.
 --
 -- The recompute joins the clone-local wisps/wisp_dependencies tables when
 -- they exist. Those are dolt-ignored and are NOT present during the
@@ -16,7 +16,7 @@
 -- clone — but issues/dependencies are dolt-versioned, so a fresh clone can
 -- still carry rows mis-set by 0047 and the issues repair must not be skipped
 -- there. Run the full issue+wisp recompute when the wisp tables exist and a
--- wisp-free variant (issues/dependencies only) when they don't; ignored/0013
+-- wisp-free variant (issues/dependencies only) when they don't; ignored/0015
 -- repairs the wisp rows once the clone-local tables materialize.
 -- The full variant queries both wisps and wisp_dependencies, so require both
 -- to exist before selecting it — a half-materialized wisp bootstrap must not
@@ -26,12 +26,28 @@ SET @has_wisps = (
     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('wisps', 'wisp_dependencies')
 );
 
+-- Existence is not enough: the full variant references wisp_dependencies'
+-- post-split target columns (depends_on_issue_id / depends_on_wisp_id, split
+-- by ignored/0003). Clone-local wisp tables created by an old binary can
+-- still carry the legacy depends_on_id shape while the synced main cursor is
+-- current, and the main-source pass runs before the ignored pass — so
+-- selecting the full variant there fails on an unknown column before
+-- ignored/0003 ever gets to split the table (the same hazard 0047 guards
+-- with a column-shape check). Require the split shape too; the wisp-free
+-- variant still repairs the issues rows, and ignored/0015 repairs the wisp
+-- rows once the clone-local chain catches up.
+SET @has_split_wisp_deps = (
+    SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'wisp_dependencies'
+      AND COLUMN_NAME IN ('depends_on_issue_id', 'depends_on_wisp_id')
+);
+
 -- Self-assign updated_at: is_blocked is derived state and issues.updated_at
 -- carries ON UPDATE CURRENT_TIMESTAMP; letting the recompute bump it plants
 -- per-clone wall clock in a synced table (see blocked_state.go, bd-578h9.19).
 UPDATE issues SET is_blocked = 0, updated_at = updated_at;
 
-SET @sql = IF(@has_wisps > 1,
+SET @sql = IF(@has_wisps > 1 AND @has_split_wisp_deps > 1,
 'WITH RECURSIVE
   directly_blocked(kind, id) AS (
     SELECT DISTINCT ''issue'', i.id
