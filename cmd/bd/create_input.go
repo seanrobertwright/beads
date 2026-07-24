@@ -319,7 +319,7 @@ func rejectSingleIssueFlagsForGraph(cmd *cobra.Command) error {
 		}
 	}
 	if cmd.Flags().Changed("mol-type") {
-		return HandleError("--mol-type is not valid with --graph (graph plans don't carry molecule semantics)")
+		return HandleError("--mol-type is not valid with --graph (set mol_type per node in the plan instead)")
 	}
 	return nil
 }

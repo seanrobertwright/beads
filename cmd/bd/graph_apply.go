@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -351,6 +352,17 @@ func createIssuesFromGraph(planFile string, dryRun bool, opts GraphApplyOptions)
 		dbPrefix:        dbPrefix,
 		allowedPrefixes: allowedPrefixes,
 	}
+	if store != nil {
+		cfg.issueExists = func(id string) (bool, error) {
+			if _, err := store.GetIssue(rootCtx, id); err != nil {
+				if errors.Is(err, storage.ErrNotFound) {
+					return false, nil
+				}
+				return false, err
+			}
+			return true, nil
+		}
+	}
 	if _, err := validateFullGraphPlan(&plan, cfg, opts, false); err != nil {
 		return HandleErrorRespectJSON("invalid graph plan: %v", err)
 	}
@@ -455,6 +467,10 @@ type graphPlanConfig struct {
 	customStatuses  []string
 	dbPrefix        string
 	allowedPrefixes string
+	// issueExists probes whether an ID is already taken by a stored issue (or
+	// wisp, where the underlying lookup spans both tables). nil skips the
+	// explicit-ID collision preflight (no store access in the calling context).
+	issueExists func(id string) (bool, error)
 }
 
 // validateFullGraphPlan runs every plan-level check in one place so the
@@ -470,7 +486,36 @@ func validateFullGraphPlan(plan *GraphApplyPlan, cfg graphPlanConfig, opts Graph
 	if err != nil {
 		return false, err
 	}
-	return useWisp, validateGraphApplyExplicitIDPrefixes(plan, cfg.dbPrefix, cfg.allowedPrefixes, opts.Force)
+	if err := validateGraphApplyExplicitIDPrefixes(plan, cfg.dbPrefix, cfg.allowedPrefixes, opts.Force); err != nil {
+		return false, err
+	}
+	return useWisp, validateGraphApplyExplicitIDCollisions(plan, cfg.issueExists)
+}
+
+// validateGraphApplyExplicitIDCollisions rejects plan nodes whose explicit id
+// already belongs to a stored issue or wisp. The insert path upserts on a
+// duplicate ID (matching `bd create --id`), which for an atomic graph create
+// would silently rewrite the existing issue while reporting creation — a plan
+// must fail fast instead. Deliberately not overridable by --force: that flag
+// vouches for a foreign prefix, not for destroying existing data. Best-effort
+// by transport: exists is nil where the calling context has no store access.
+func validateGraphApplyExplicitIDCollisions(plan *GraphApplyPlan, exists func(id string) (bool, error)) error {
+	if exists == nil {
+		return nil
+	}
+	for _, node := range plan.Nodes {
+		if node.ID == "" {
+			continue
+		}
+		taken, err := exists(node.ID)
+		if err != nil {
+			return fmt.Errorf("checking explicit id %q (node %q): %w", node.ID, node.Key, err)
+		}
+		if taken {
+			return fmt.Errorf("explicit id %q (node %q) already exists; graph create will not overwrite an existing issue — drop the id to mint a new one, or update the existing issue instead", node.ID, node.Key)
+		}
+	}
+	return nil
 }
 
 func validateGraphApplyPlan(plan *GraphApplyPlan, customTypes, customStatuses []string, opts GraphApplyOptions) error {

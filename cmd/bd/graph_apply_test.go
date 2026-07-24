@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"reflect"
 	"sort"
@@ -739,6 +740,54 @@ func TestValidateGraphApplyPlanRejectsDuplicateExplicitIDs(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "duplicate explicit id") {
 		t.Fatalf("expected duplicate explicit id error, got %v", err)
 	}
+}
+
+func TestValidateGraphApplyExplicitIDCollisions(t *testing.T) {
+	plan := &GraphApplyPlan{
+		Nodes: []GraphApplyNode{
+			{Key: "a", Title: "A", ID: "bd-taken"},
+			{Key: "b", Title: "B"},
+		},
+	}
+
+	t.Run("nil probe skips", func(t *testing.T) {
+		if err := validateGraphApplyExplicitIDCollisions(plan, nil); err != nil {
+			t.Fatalf("nil probe: want nil error, got %v", err)
+		}
+	})
+
+	t.Run("collision rejected with node context", func(t *testing.T) {
+		err := validateGraphApplyExplicitIDCollisions(plan, func(id string) (bool, error) {
+			return id == "bd-taken", nil
+		})
+		if err == nil || !strings.Contains(err.Error(), "already exists") ||
+			!strings.Contains(err.Error(), "bd-taken") || !strings.Contains(err.Error(), `"a"`) {
+			t.Fatalf("expected already-exists error naming id and node, got %v", err)
+		}
+	})
+
+	t.Run("free id passes and probe skips id-less nodes", func(t *testing.T) {
+		var probed []string
+		err := validateGraphApplyExplicitIDCollisions(plan, func(id string) (bool, error) {
+			probed = append(probed, id)
+			return false, nil
+		})
+		if err != nil {
+			t.Fatalf("free id: want nil error, got %v", err)
+		}
+		if len(probed) != 1 || probed[0] != "bd-taken" {
+			t.Fatalf("want exactly the explicit id probed, got %v", probed)
+		}
+	})
+
+	t.Run("probe error propagates", func(t *testing.T) {
+		err := validateGraphApplyExplicitIDCollisions(plan, func(string) (bool, error) {
+			return false, fmt.Errorf("store offline")
+		})
+		if err == nil || !strings.Contains(err.Error(), "store offline") {
+			t.Fatalf("expected probe error to propagate, got %v", err)
+		}
+	})
 }
 
 func TestValidateGraphApplyPlanEdgeGateRules(t *testing.T) {

@@ -48,7 +48,8 @@ Node notes:
 
 - `key` is a plan-local symbolic name; the result maps each key to the minted
   issue ID. `id` optionally pins an explicit issue ID instead (must match the
-  database prefix, like `bd create --id`).
+  database prefix, like `bd create --id`, and must not already exist — a plan
+  never overwrites an existing issue).
 - `parent_key` (a plan node key) or `parent_id` (an existing issue ID) adds a
   `parent-child` dependency on the created node.
 - `parent` and `estimate` are accepted aliases for `parent_key` and

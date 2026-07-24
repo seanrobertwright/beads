@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -11,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/steveyegge/beads/internal/config"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/domain"
 	"github.com/steveyegge/beads/internal/storage/uow"
 	"github.com/steveyegge/beads/internal/types"
@@ -384,11 +387,15 @@ func runCreateProxiedGraph(_ *cobra.Command, ctx context.Context, in createInput
 			return HandleError("open unit of work: %v", err)
 		}
 		cctx, err := dryUW.ConfigUseCase().LoadCreateContext(ctx)
-		dryUW.Close(ctx)
 		if err != nil {
+			dryUW.Close(ctx)
 			return HandleError("load create context: %v", err)
 		}
-		if _, err := validateProxiedGraphPlan(&plan, in, cctx); err != nil {
+		// Keep the UOW open through validation: the explicit-ID collision
+		// preflight reads through it.
+		_, err = validateProxiedGraphPlan(&plan, in, cctx, uowIssueExists(ctx, dryUW))
+		dryUW.Close(ctx)
+		if err != nil {
 			return HandleError("invalid graph plan: %v", err)
 		}
 		if err := emitGraphApplyDryRun(&plan, in.graphApplyOptions()); err != nil {
@@ -414,8 +421,10 @@ func runCreateProxiedGraph(_ *cobra.Command, ctx context.Context, in createInput
 		}
 
 		// validateProxiedGraphPlan enforces a uniform storage class, so its
-		// resolved useWisp decides which table the whole plan routes to.
-		useWisp, err := validateProxiedGraphPlan(&plan, in, cctx)
+		// resolved useWisp decides which table the whole plan routes to. The
+		// collision preflight runs inside this transaction, so it cannot race
+		// a concurrent create of the same explicit ID.
+		useWisp, err := validateProxiedGraphPlan(&plan, in, cctx, uowIssueExists(ctx, uw))
 		if err != nil {
 			return nil, "", fmt.Errorf("invalid graph plan: %w", err)
 		}
@@ -459,9 +468,10 @@ func runCreateProxiedGraph(_ *cobra.Command, ctx context.Context, in createInput
 
 // validateProxiedGraphPlan runs full plan validation for proxied-server mode:
 // shared plan checks, uniform storage class (proxied routes the whole plan to
-// one table), and explicit-ID prefix checks against the server's config. The
-// returned useWisp is the plan-wide table routing decision.
-func validateProxiedGraphPlan(plan *GraphApplyPlan, in createInput, cctx domain.CreateContext) (useWisp bool, err error) {
+// one table), explicit-ID prefix checks against the server's config, and the
+// explicit-ID collision preflight through the unit of work's issue lookup.
+// The returned useWisp is the plan-wide table routing decision.
+func validateProxiedGraphPlan(plan *GraphApplyPlan, in createInput, cctx domain.CreateContext, issueExists func(id string) (bool, error)) (useWisp bool, err error) {
 	cfg := graphPlanConfig{
 		customTypes: resolveProxiedCustomTypes(cctx.CustomTypes),
 		// No YAML fallback for statuses — the server database is authoritative
@@ -471,8 +481,32 @@ func validateProxiedGraphPlan(plan *GraphApplyPlan, in createInput, cctx domain.
 		customStatuses:  types.CustomStatusNames(cctx.CustomStatuses),
 		dbPrefix:        overlayYAMLPrefix(cctx.IssuePrefix),
 		allowedPrefixes: cctx.AllowedPrefixes,
+		issueExists:     issueExists,
 	}
 	return validateFullGraphPlan(plan, cfg, in.graphApplyOptions(), true)
+}
+
+// uowIssueExists adapts a unit of work's issue lookups to the plan
+// validator's explicit-ID collision probe, bound to the caller's context so
+// in-transaction validation reads its own transaction. Issues and wisps share
+// one ID space but the domain getters are per-table, so probe both.
+func uowIssueExists(ctx context.Context, uw uow.UnitOfWork) func(id string) (bool, error) {
+	isNotFound := func(err error) bool {
+		return errors.Is(err, storage.ErrNotFound) || errors.Is(err, sql.ErrNoRows)
+	}
+	return func(id string) (bool, error) {
+		if _, err := uw.IssueUseCase().GetIssue(ctx, id); err == nil {
+			return true, nil
+		} else if !isNotFound(err) {
+			return false, err
+		}
+		if _, err := uw.IssueUseCase().GetWisp(ctx, id); err == nil {
+			return true, nil
+		} else if !isNotFound(err) {
+			return false, err
+		}
+		return false, nil
+	}
 }
 
 // graphApplyNodeIssue path (full issue-model parity with `bd create`).
